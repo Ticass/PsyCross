@@ -69,7 +69,7 @@ float samplePSX(vec2 tc, int format) {
 }
 
 vec4 sampleNative(vec2 tc, int format) {
-    if (ubo.renderInfo.z > 0.5 && vIs3D > 0.5) {
+    if ((ubo.renderInfo.z > 0.5 && vIs3D > 0.5) || ubo.renderInfo.z > 1.5) {
         vec2 f = fract(tc);
         vec2 p = floor(tc);
         float a = samplePSX(p, format);
