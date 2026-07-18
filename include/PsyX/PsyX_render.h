@@ -6,7 +6,9 @@
 /*
  * Platform specific emulator setup
  */
-#if (defined(_WIN32) || defined(__APPLE__) || defined(__linux__)) && !defined(__ANDROID__) && !defined(__EMSCRIPTEN__) && !defined(__RPI__)
+#if defined(PSYX_RENDERER_VULKAN)
+#   define RENDERER_VULKAN
+#elif (defined(_WIN32) || defined(__APPLE__) || defined(__linux__)) && !defined(__ANDROID__) && !defined(__EMSCRIPTEN__) && !defined(__RPI__)
 #   define RENDERER_OGL
 #   define USE_GLAD
 #elif defined(__RPI__)
@@ -191,7 +193,7 @@ typedef enum
 } TexFormat;
 
 
-#if defined(RENDERER_OGLES) || defined(RENDERER_OGL)
+#if defined(RENDERER_OGLES) || defined(RENDERER_OGL) || defined(RENDERER_VULKAN)
 typedef uint TextureID;
 typedef uint ShaderID;
 #else
@@ -206,6 +208,16 @@ extern TextureID	g_whiteTexture;
 extern TextureID	g_vramTexture;
 
 extern void			GR_SwapWindow();
+extern void         GR_WaitIdle(void);
+extern int          GR_ReadBackbuffer(void* rgba, int width, int height);
+/* Present one tightly-packed RGB24 frame with aspect-correct letterboxing.
+ * Used by the PC FMV decoder so movie playback does not depend on a specific
+ * graphics API. Returns non-zero when the frame was presented. */
+extern int          GR_BlitRGB24Frame(const void* rgb, int width, int height);
+extern void         GR_ClearDepthStencil(void);
+extern const char*  GR_GetRendererName(void);
+extern const char*  GR_GetRendererVendor(void);
+extern const char*  GR_GetRendererVersion(void);
 
 // PSX VRAM operations
 extern void			GR_SaveVRAM(const char* outputFileName, int x, int y, int width, int height, int bReadFromFrameBuffer);
@@ -230,6 +242,9 @@ extern void			GR_DumpVRAM(const char* path);
 extern int			g_PsxSkipFramebufferStore;
 
 extern TextureID	GR_CreateRGBATexture(int width, int height, u_char* data /*= nullptr*/);
+extern int          GR_UploadRGBATexture(TextureID* texture, const u_char* data,
+                                         int width, int height, int nearest,
+                                         int generateMipmaps);
 extern ShaderID		GR_Shader_Compile(const char* source);
 
 extern void			GR_SetShader(const ShaderID shader);
@@ -254,6 +269,13 @@ extern void			GR_Clear(int x, int y, int w, int h, unsigned char r, unsigned cha
 extern void			GR_ClearVRAM(int x, int y, int w, int h, unsigned char r, unsigned char g, unsigned char b);
 extern void			GR_UpdateVertexBuffer(const GrVertex* vertices, int count);
 extern void			GR_DrawTriangles(int start_vertex, int triangles);
+
+/* Backend-neutral debug/HUD overlay path. Coordinates are OpenGL-style NDC
+ * (-1..1, +Y up); RGBA uploads are tightly packed. */
+extern int          GR_OverlayUploadRGBA(TextureID* texture, const unsigned char* rgba, int width, int height);
+extern void         GR_OverlayDrawQuad(TextureID texture, float x0, float y0, float x1, float y1,
+                                       float u0, float v0, float u1, float v1);
+extern void         GR_OverlayDrawLines(const float* xyRgb, int vertexCount);
 
 /* Flashlight shadow map depth pre-pass (see g_PsyX_UseFlashlightShadows). Call
  * GR_ShadowPassBegin() once after GR_UpdateVertexBuffer while the frame VAO is

@@ -1,3 +1,5 @@
+#if !defined(PSYX_RENDERER_VULKAN)
+
 #ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -1527,6 +1529,34 @@ TextureID GR_CreateRGBATexture(int width, int height, u_char* data /*= nullptr*/
 	glBindTexture(GL_TEXTURE_2D, 0);
 
 	return newTexture;
+}
+
+int GR_UploadRGBATexture(TextureID* texture, const u_char* data, int width,
+	int height, int nearest, int generateMipmaps)
+{
+	if (texture == NULL || data == NULL || width <= 0 || height <= 0)
+		return 0;
+	if (*texture == 0)
+		glGenTextures(1, texture);
+	if (*texture == 0)
+		return 0;
+	glBindTexture(GL_TEXTURE_2D, *texture);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
+		GL_RGBA, GL_UNSIGNED_BYTE, data);
+	if (generateMipmaps && !nearest && glGenerateMipmap != NULL)
+	{
+		glGenerateMipmap(GL_TEXTURE_2D);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+	}
+	else
+	{
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, nearest ? GL_NEAREST : GL_LINEAR);
+	}
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, nearest ? GL_NEAREST : GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	return 1;
 }
 
 void GR_CompilePSXShader(GTEShader* sh, const char* source)
@@ -3716,3 +3746,23 @@ void GR_PopDebugLabel()
 	glPopDebugGroup();
 #endif
 }
+
+void GR_WaitIdle(void)
+{
+	glFinish();
+}
+
+int GR_ReadBackbuffer(void* rgba, int width, int height)
+{
+	if (!rgba || width != g_windowWidth || height != g_windowHeight)
+		return 0;
+	glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+	return 1;
+}
+void GR_ClearDepthStencil(void) { glClearDepth(1.0); glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT); }
+
+const char* GR_GetRendererName(void) { return (const char*)glGetString(GL_RENDERER); }
+const char* GR_GetRendererVendor(void) { return (const char*)glGetString(GL_VENDOR); }
+const char* GR_GetRendererVersion(void) { return (const char*)glGetString(GL_VERSION); }
+
+#endif /* !PSYX_RENDERER_VULKAN */

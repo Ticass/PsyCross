@@ -1021,11 +1021,11 @@ void PsyX_TakeScreenshot()
 {
 	u_char* pixels = (u_char*)malloc(g_windowWidth * g_windowHeight * 4);
 	
-#if defined(RENDERER_OGL)
-	glReadPixels(0, 0, g_windowWidth, g_windowHeight, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
-#elif defined(RENDERER_OGLES)
-	glReadPixels(0, 0, g_windowWidth, g_windowHeight, GL_RGBA, GL_UNSIGNED_BYTE, pixels);	// FIXME: is that correct format?
-#endif
+	if (!GR_ReadBackbuffer(pixels, g_windowWidth, g_windowHeight))
+	{
+		free(pixels);
+		return;
+	}
 
 	SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(pixels, g_windowWidth, g_windowHeight, 8 * 4, g_windowWidth * 4, 0, 0, 0, 0);
 
@@ -1200,8 +1200,8 @@ void PsyX_ApplyWindowState(int width, int height, int fullscreen)
 
 void PsyX_WaitForTimestep(int count)
 {
-#if 0 // defined(RENDERER_OGL) || defined(RENDERER_OGLES)
-	glFinish(); // best time to complete GPU drawing
+#if 0
+	GR_WaitIdle(); // best time to complete GPU drawing
 #endif
 
 	// wait for vblank
