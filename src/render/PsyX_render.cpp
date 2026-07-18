@@ -1544,8 +1544,16 @@ int GR_UploadRGBATexture(TextureID* texture, const u_char* data, int width,
 	if (*texture == 0)
 		return 0;
 	glBindTexture(GL_TEXTURE_2D, *texture);
+	while (glGetError() != GL_NO_ERROR) { }
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
 		GL_RGBA, GL_UNSIGNED_BYTE, data);
+	if (glGetError() != GL_NO_ERROR)
+	{
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glDeleteTextures(1, texture);
+		*texture = 0;
+		return 0;
+	}
 	if (generateMipmaps && !nearest && glGenerateMipmap != NULL)
 	{
 		glGenerateMipmap(GL_TEXTURE_2D);
