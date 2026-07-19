@@ -218,6 +218,9 @@ extern void         GR_ClearDepthStencil(void);
 extern const char*  GR_GetRendererName(void);
 extern const char*  GR_GetRendererVendor(void);
 extern const char*  GR_GetRendererVersion(void);
+extern int          GR_RayTracingAvailable(void);
+extern int          GR_RayTracingEnabled(void);
+extern const char*  GR_RayTracingStatus(void);
 
 // PSX VRAM operations
 extern void			GR_SaveVRAM(const char* outputFileName, int x, int y, int width, int height, int bReadFromFrameBuffer);

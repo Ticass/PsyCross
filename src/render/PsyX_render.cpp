@@ -184,6 +184,7 @@ int g_PsxDitherSuppressed = 0;
  * single-sample peer become illegal — GR_StoreFrameBuffer resolves first and
  * GR_PresentLastFrame draws a fullscreen quad instead of blitting. */
 int g_cfg_msaaSamples = 0;
+int g_cfg_rtgi = 0;
 
 /* PC port: full-screen post-process look applied once per frame in
  * GR_PostProcess (PsyX_EndScene, after the freeze capture + console hook, just
@@ -3783,5 +3784,8 @@ void GR_ClearDepthStencil(void) { glClearDepth(1.0); glClear(GL_DEPTH_BUFFER_BIT
 const char* GR_GetRendererName(void) { return (const char*)glGetString(GL_RENDERER); }
 const char* GR_GetRendererVendor(void) { return (const char*)glGetString(GL_VENDOR); }
 const char* GR_GetRendererVersion(void) { return (const char*)glGetString(GL_VERSION); }
+int GR_RayTracingAvailable(void) { return 0; }
+int GR_RayTracingEnabled(void) { return 0; }
+const char* GR_RayTracingStatus(void) { return "unavailable (OpenGL backend)"; }
 
 #endif /* !PSYX_RENDERER_VULKAN */

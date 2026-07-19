@@ -49,6 +49,7 @@ int g_PcHorPlusEnabled = 1, g_PcMenuPillarbox = 1, g_PcWidescreenMode = 1;
 int g_cfg_pgxpTextureCorrection = 1, g_cfg_pgxpZBuffer = 1;
 int g_PsxUsePgxp = 0, g_cfg_bilinearFiltering = 0, g_cfg_menuFilter = 0, g_cfg_affineTextures = 0;
 int g_cfg_psxDither = 1, g_PsxDitherSuppressed = 0, g_cfg_msaaSamples = 0;
+int g_cfg_rtgi = 0;
 int g_cfg_postProcess = 0, g_cfg_tonemap = 0;
 int g_PsyX_UsePerPixelFlashlight = 0, g_PsyX_FlashlightStyle = 0;
 int g_PsyX_UseFlashlightShadows = 0, g_PsyX_FlashlightActive = 0;
@@ -129,6 +130,19 @@ struct VulkanState {
     VkQueue queue = VK_NULL_HANDLE;
     PFN_vkCmdBeginDebugUtilsLabelEXT cmdBeginDebugLabel = nullptr;
     PFN_vkCmdEndDebugUtilsLabelEXT cmdEndDebugLabel = nullptr;
+    PFN_vkGetBufferDeviceAddressKHR getBufferDeviceAddress = nullptr;
+    PFN_vkCreateAccelerationStructureKHR createAccelerationStructure = nullptr;
+    PFN_vkDestroyAccelerationStructureKHR destroyAccelerationStructure = nullptr;
+    PFN_vkGetAccelerationStructureBuildSizesKHR getAccelerationStructureBuildSizes = nullptr;
+    PFN_vkCmdBuildAccelerationStructuresKHR cmdBuildAccelerationStructures = nullptr;
+    PFN_vkGetAccelerationStructureDeviceAddressKHR getAccelerationStructureDeviceAddress = nullptr;
+    bool rayQueryAvailable = false;
+    char rayStatus[160] = "not initialized";
+    VkPhysicalDeviceAccelerationStructurePropertiesKHR accelerationProperties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+    VkBuffer rtProbeBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory rtProbeMemory = VK_NULL_HANDLE;
+    VkDeviceAddress rtProbeAddress = 0;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkFormat colorFormat = VK_FORMAT_UNDEFINED;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
@@ -245,6 +259,32 @@ static bool Check(VkResult result, const char* what) {
     return false;
 }
 
+static bool HasDeviceExtension(VkPhysicalDevice device, const char* name) {
+    uint32_t count = 0;
+    if (vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr) != VK_SUCCESS)
+        return false;
+    std::vector<VkExtensionProperties> extensions(count);
+    if (vkEnumerateDeviceExtensionProperties(device, nullptr, &count, extensions.data()) != VK_SUCCESS)
+        return false;
+    for (const VkExtensionProperties& extension : extensions)
+        if (strcmp(extension.extensionName, name) == 0) return true;
+    return false;
+}
+
+static bool HasRayQueryExtensions(VkPhysicalDevice device) {
+    static const char* required[] = {
+        VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+        VK_KHR_RAY_QUERY_EXTENSION_NAME,
+        VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+        VK_KHR_SPIRV_1_4_EXTENSION_NAME,
+        VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME
+    };
+    for (const char* extension : required)
+        if (!HasDeviceExtension(device, extension)) return false;
+    return true;
+}
+
 static void RememberFramebufferRect(int x,int y,int w,int h) {
     if(w<=0||h<=0)return;
     for(uint32_t i=0;i<vk.framebufferRectCount;i++){
@@ -295,12 +335,18 @@ static uint32_t FindMemory(uint32_t bits, VkMemoryPropertyFlags flags) {
 }
 
 static bool CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
-                         VkBuffer& buffer, VkDeviceMemory& memory, void** mapped = nullptr) {
+                         VkBuffer& buffer, VkDeviceMemory& memory, void** mapped = nullptr,
+                         bool deviceAddress = false) {
+    if (deviceAddress) usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size=size; bi.usage=usage;
     if (!Check(vkCreateBuffer(vk.device,&bi,nullptr,&buffer),"vkCreateBuffer")) return false;
     VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(vk.device,buffer,&mr);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize=mr.size; ai.memoryTypeIndex=FindMemory(mr.memoryTypeBits,props);
-    if (ai.memoryTypeIndex==UINT32_MAX || !Check(vkAllocateMemory(vk.device,&ai,nullptr,&memory),"vkAllocateMemory")) return false;
+    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    if (deviceAddress) { flags.flags=VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT; ai.pNext=&flags; }
+    if (ai.memoryTypeIndex==UINT32_MAX || !Check(vkAllocateMemory(vk.device,&ai,nullptr,&memory),"vkAllocateMemory")) {
+        vkDestroyBuffer(vk.device,buffer,nullptr); buffer=VK_NULL_HANDLE; return false;
+    }
     vkBindBufferMemory(vk.device,buffer,memory,0);
     if (mapped) Check(vkMapMemory(vk.device,memory,0,size,0,mapped),"vkMapMemory");
     return true;
@@ -528,12 +574,69 @@ static bool InitDevice() {
     uint32_t availableCount=0;vkEnumerateInstanceExtensionProperties(nullptr,&availableCount,nullptr);std::vector<VkExtensionProperties> availableExtensions(availableCount);vkEnumerateInstanceExtensionProperties(nullptr,&availableCount,availableExtensions.data());
     for(const VkExtensionProperties& extension:availableExtensions)if(strcmp(extension.extensionName,VK_EXT_DEBUG_UTILS_EXTENSION_NAME)==0){exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);break;}
     extCount=(unsigned)exts.size();
-    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};app.pApplicationName="Silent Hill PC";app.apiVersion=VK_API_VERSION_1_1;VkInstanceCreateInfo ii{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};ii.pApplicationInfo=&app;ii.enabledExtensionCount=extCount;ii.ppEnabledExtensionNames=exts.data();if(!Check(vkCreateInstance(&ii,nullptr,&vk.instance),"instance"))return false;
+    uint32_t loaderVersion=VK_API_VERSION_1_0;
+    if(vkEnumerateInstanceVersion(&loaderVersion)!=VK_SUCCESS)loaderVersion=VK_API_VERSION_1_0;
+    uint32_t requestedApi=loaderVersion>=VK_API_VERSION_1_2?VK_API_VERSION_1_2:
+                          loaderVersion>=VK_API_VERSION_1_1?VK_API_VERSION_1_1:VK_API_VERSION_1_0;
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};app.pApplicationName="Silent Hill PC";app.apiVersion=requestedApi;VkInstanceCreateInfo ii{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};ii.pApplicationInfo=&app;ii.enabledExtensionCount=extCount;ii.ppEnabledExtensionNames=exts.data();if(!Check(vkCreateInstance(&ii,nullptr,&vk.instance),"instance"))return false;
     if(!SDL_Vulkan_CreateSurface(g_window,vk.instance,&vk.surface)){eprinterr("SDL Vulkan surface: %s\n",SDL_GetError());return false;}
-    uint32_t count=0;vkEnumeratePhysicalDevices(vk.instance,&count,nullptr);std::vector<VkPhysicalDevice> devs(count);vkEnumeratePhysicalDevices(vk.instance,&count,devs.data());for(auto d:devs){uint32_t qn=0;vkGetPhysicalDeviceQueueFamilyProperties(d,&qn,nullptr);for(uint32_t q=0;q<qn;q++){VkBool32 present=0;vkGetPhysicalDeviceSurfaceSupportKHR(d,q,vk.surface,&present);VkQueueFamilyProperties qp{};std::vector<VkQueueFamilyProperties> qq(qn);vkGetPhysicalDeviceQueueFamilyProperties(d,&qn,qq.data());if(present&&(qq[q].queueFlags&VK_QUEUE_GRAPHICS_BIT)){vk.physical=d;vk.queueFamily=q;break;}}if(vk.physical)break;}if(!vk.physical){eprinterr("No Vulkan graphics/present device\n");return false;}
+    uint32_t count=0;vkEnumeratePhysicalDevices(vk.instance,&count,nullptr);std::vector<VkPhysicalDevice> devs(count);vkEnumeratePhysicalDevices(vk.instance,&count,devs.data());
+    int bestScore=-1;
+    for(auto d:devs){
+        uint32_t qn=0;vkGetPhysicalDeviceQueueFamilyProperties(d,&qn,nullptr);std::vector<VkQueueFamilyProperties> qq(qn);vkGetPhysicalDeviceQueueFamilyProperties(d,&qn,qq.data());
+        for(uint32_t q=0;q<qn;q++){
+            VkBool32 present=0;vkGetPhysicalDeviceSurfaceSupportKHR(d,q,vk.surface,&present);
+            if(!present||!(qq[q].queueFlags&VK_QUEUE_GRAPHICS_BIT))continue;
+            VkPhysicalDeviceProperties properties{};vkGetPhysicalDeviceProperties(d,&properties);
+            int score=HasRayQueryExtensions(d)?10000:0;
+            if(properties.deviceType==VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)score+=1000;
+            else if(properties.deviceType==VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)score+=100;
+            if(score>bestScore){bestScore=score;vk.physical=d;vk.queueFamily=q;}
+            break;
+        }
+    }
+    if(!vk.physical){eprinterr("No Vulkan graphics/present device\n");return false;}
     vk.depthFormat=VK_FORMAT_UNDEFINED;for(VkFormat candidate:{VK_FORMAT_D24_UNORM_S8_UINT,VK_FORMAT_D32_SFLOAT_S8_UINT,VK_FORMAT_D16_UNORM_S8_UINT}){VkFormatProperties properties{};vkGetPhysicalDeviceFormatProperties(vk.physical,candidate,&properties);if(properties.optimalTilingFeatures&VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT){vk.depthFormat=candidate;break;}}if(vk.depthFormat==VK_FORMAT_UNDEFINED){eprinterr("Vulkan: no depth/stencil attachment format available\n");return false;}
     VkPhysicalDeviceProperties deviceProperties{};vkGetPhysicalDeviceProperties(vk.physical,&deviceProperties);VkSampleCountFlags supported=deviceProperties.limits.framebufferColorSampleCounts&deviceProperties.limits.framebufferDepthSampleCounts;int requested=g_cfg_msaaSamples;vk.samples=VK_SAMPLE_COUNT_1_BIT;if(requested>=8&&(supported&VK_SAMPLE_COUNT_8_BIT))vk.samples=VK_SAMPLE_COUNT_8_BIT;else if(requested>=4&&(supported&VK_SAMPLE_COUNT_4_BIT))vk.samples=VK_SAMPLE_COUNT_4_BIT;else if(requested>=2&&(supported&VK_SAMPLE_COUNT_2_BIT))vk.samples=VK_SAMPLE_COUNT_2_BIT;g_cfg_msaaSamples=vk.samples==VK_SAMPLE_COUNT_8_BIT?8:vk.samples==VK_SAMPLE_COUNT_4_BIT?4:vk.samples==VK_SAMPLE_COUNT_2_BIT?2:0;eprintf("*Vulkan MSAA: %dx\n",g_cfg_msaaSamples);
-    float priority=1;VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};qi.queueFamilyIndex=vk.queueFamily;qi.queueCount=1;qi.pQueuePriorities=&priority;const char* swapExt=VK_KHR_SWAPCHAIN_EXTENSION_NAME;VkPhysicalDeviceFeatures supportedFeatures{};vkGetPhysicalDeviceFeatures(vk.physical,&supportedFeatures);VkPhysicalDeviceFeatures features{};features.fillModeNonSolid=supportedFeatures.fillModeNonSolid;vk.fillModeNonSolid=features.fillModeNonSolid==VK_TRUE;VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};di.queueCreateInfoCount=1;di.pQueueCreateInfos=&qi;di.enabledExtensionCount=1;di.ppEnabledExtensionNames=&swapExt;di.pEnabledFeatures=&features;if(!Check(vkCreateDevice(vk.physical,&di,nullptr,&vk.device),"device"))return false;vkGetDeviceQueue(vk.device,vk.queueFamily,0,&vk.queue);vk.cmdBeginDebugLabel=(PFN_vkCmdBeginDebugUtilsLabelEXT)vkGetDeviceProcAddr(vk.device,"vkCmdBeginDebugUtilsLabelEXT");vk.cmdEndDebugLabel=(PFN_vkCmdEndDebugUtilsLabelEXT)vkGetDeviceProcAddr(vk.device,"vkCmdEndDebugUtilsLabelEXT");
+    float priority=1;VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};qi.queueFamilyIndex=vk.queueFamily;qi.queueCount=1;qi.pQueuePriorities=&priority;
+    VkPhysicalDeviceFeatures supportedFeatures{};vkGetPhysicalDeviceFeatures(vk.physical,&supportedFeatures);VkPhysicalDeviceFeatures features{};features.fillModeNonSolid=supportedFeatures.fillModeNonSolid;vk.fillModeNonSolid=features.fillModeNonSolid==VK_TRUE;
+    std::vector<const char*> deviceExtensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    VkPhysicalDeviceBufferDeviceAddressFeatures bda{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR acceleration{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQuery{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+    const bool rayExtensions=HasRayQueryExtensions(vk.physical);
+    bda.pNext=&acceleration;acceleration.pNext=&rayQuery;
+    VkPhysicalDeviceFeatures2 featureQuery{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};featureQuery.pNext=rayExtensions?&bda:nullptr;vkGetPhysicalDeviceFeatures2(vk.physical,&featureQuery);
+    vk.rayQueryAvailable=rayExtensions&&bda.bufferDeviceAddress&&acceleration.accelerationStructure&&rayQuery.rayQuery;
+    void* deviceFeatureChain=nullptr;
+    if(vk.rayQueryAvailable){
+        static const char* rayExtensionsToEnable[]={
+            VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,VK_KHR_RAY_QUERY_EXTENSION_NAME,
+            VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+            VK_KHR_SPIRV_1_4_EXTENSION_NAME,VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME};
+        deviceExtensions.insert(deviceExtensions.end(),std::begin(rayExtensionsToEnable),std::end(rayExtensionsToEnable));
+        bda.bufferDeviceAddress=VK_TRUE;acceleration.accelerationStructure=VK_TRUE;rayQuery.rayQuery=VK_TRUE;deviceFeatureChain=&bda;
+    }else{
+        snprintf(vk.rayStatus,sizeof(vk.rayStatus),"unavailable (ray-query extensions/features missing)");
+    }
+    VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};di.pNext=deviceFeatureChain;di.queueCreateInfoCount=1;di.pQueueCreateInfos=&qi;di.enabledExtensionCount=(uint32_t)deviceExtensions.size();di.ppEnabledExtensionNames=deviceExtensions.data();di.pEnabledFeatures=&features;if(!Check(vkCreateDevice(vk.physical,&di,nullptr,&vk.device),"device"))return false;
+    vkGetDeviceQueue(vk.device,vk.queueFamily,0,&vk.queue);vk.cmdBeginDebugLabel=(PFN_vkCmdBeginDebugUtilsLabelEXT)vkGetDeviceProcAddr(vk.device,"vkCmdBeginDebugUtilsLabelEXT");vk.cmdEndDebugLabel=(PFN_vkCmdEndDebugUtilsLabelEXT)vkGetDeviceProcAddr(vk.device,"vkCmdEndDebugUtilsLabelEXT");
+    if(vk.rayQueryAvailable){
+        vk.getBufferDeviceAddress=(PFN_vkGetBufferDeviceAddressKHR)vkGetDeviceProcAddr(vk.device,"vkGetBufferDeviceAddressKHR");
+        if(!vk.getBufferDeviceAddress)vk.getBufferDeviceAddress=(PFN_vkGetBufferDeviceAddressKHR)vkGetDeviceProcAddr(vk.device,"vkGetBufferDeviceAddress");
+        vk.createAccelerationStructure=(PFN_vkCreateAccelerationStructureKHR)vkGetDeviceProcAddr(vk.device,"vkCreateAccelerationStructureKHR");
+        vk.destroyAccelerationStructure=(PFN_vkDestroyAccelerationStructureKHR)vkGetDeviceProcAddr(vk.device,"vkDestroyAccelerationStructureKHR");
+        vk.getAccelerationStructureBuildSizes=(PFN_vkGetAccelerationStructureBuildSizesKHR)vkGetDeviceProcAddr(vk.device,"vkGetAccelerationStructureBuildSizesKHR");
+        vk.cmdBuildAccelerationStructures=(PFN_vkCmdBuildAccelerationStructuresKHR)vkGetDeviceProcAddr(vk.device,"vkCmdBuildAccelerationStructuresKHR");
+        vk.getAccelerationStructureDeviceAddress=(PFN_vkGetAccelerationStructureDeviceAddressKHR)vkGetDeviceProcAddr(vk.device,"vkGetAccelerationStructureDeviceAddressKHR");
+        if(!vk.getBufferDeviceAddress||!vk.createAccelerationStructure||!vk.destroyAccelerationStructure||!vk.getAccelerationStructureBuildSizes||!vk.cmdBuildAccelerationStructures||!vk.getAccelerationStructureDeviceAddress){
+            vk.rayQueryAvailable=false;snprintf(vk.rayStatus,sizeof(vk.rayStatus),"unavailable (driver entry points missing)");
+        }else{
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};properties.pNext=&vk.accelerationProperties;vkGetPhysicalDeviceProperties2(vk.physical,&properties);
+            snprintf(vk.rayStatus,sizeof(vk.rayStatus),"hardware ray query ready (AS/BDA; GI pass pending)");
+            eprintf("*Vulkan RT: %s, max AS geometries %llu\n",vk.rayStatus,(unsigned long long)vk.accelerationProperties.maxGeometryCount);
+        }
+    }
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=vk.queueFamily;cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;vkCreateCommandPool(vk.device,&cp,nullptr,&vk.commandPool);VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};ca.commandPool=vk.commandPool;ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ca.commandBufferCount=1;vkAllocateCommandBuffers(vk.device,&ca,&vk.command);VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};vkCreateSemaphore(vk.device,&si,nullptr,&vk.acquired);vkCreateSemaphore(vk.device,&si,nullptr,&vk.complete);VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};fi.flags=VK_FENCE_CREATE_SIGNALED_BIT;vkCreateFence(vk.device,&fi,nullptr,&vk.fence);
     return CreateSwapchain();
 }
@@ -621,9 +724,26 @@ static void RecordVRAMUpload(VkCommandBuffer cmd){
 }
 }
 
+int GR_RayTracingAvailable(void){return vk.rayQueryAvailable?1:0;}
+int GR_RayTracingEnabled(void){return (g_cfg_rtgi&&vk.rayQueryAvailable&&vk.rtProbeAddress)?1:0;}
+const char* GR_RayTracingStatus(void){return vk.rayStatus;}
+
 int GR_InitialiseRender(char* name,int width,int height,int fullscreen){uint32_t flags=SDL_WINDOW_VULKAN|SDL_WINDOW_RESIZABLE;if(fullscreen==1)flags|=SDL_WINDOW_FULLSCREEN;if(fullscreen==2)flags|=SDL_WINDOW_FULLSCREEN_DESKTOP;g_window=SDL_CreateWindow(name,SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,width,height,flags);if(!g_window){eprinterr("SDL window: %s\n",SDL_GetError());return 0;}if(!InitDevice())return 0;eprintf("*Renderer: Vulkan\n");return 1;}
 
 int GR_InitialisePSX(){memset(vram,0,sizeof(vram));VkPhysicalDeviceProperties p{};vkGetPhysicalDeviceProperties(vk.physical,&p);vk.uniformStride=(sizeof(Uniforms)+p.limits.minUniformBufferOffsetAlignment-1)&~(p.limits.minUniformBufferOffsetAlignment-1);VertexSlice firstVertexSlice{};CreateBuffer(kVertexBytes,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,firstVertexSlice.buffer,firstVertexSlice.memory,&firstVertexSlice.mapped);vk.vertexSlices.push_back(firstVertexSlice);CreateBuffer(vk.uniformStride*kUniformSlots,VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,vk.uniformBuffer,vk.uniformMemory,&vk.uniformMap);
+    /* Exercise the exact allocation path future BLAS/TLAS inputs will use. A
+     * non-zero address proves both device-address memory and the driver entry
+     * point work, instead of reporting support from extension strings alone. */
+    if(vk.rayQueryAvailable){
+        if(CreateBuffer(256,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,vk.rtProbeBuffer,vk.rtProbeMemory,nullptr,true)){
+            VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};addressInfo.buffer=vk.rtProbeBuffer;vk.rtProbeAddress=vk.getBufferDeviceAddress(vk.device,&addressInfo);
+        }
+        if(!vk.rtProbeAddress){
+            vk.rayQueryAvailable=false;snprintf(vk.rayStatus,sizeof(vk.rayStatus),"unavailable (device-address probe failed)");
+            if(vk.rtProbeBuffer){vkDestroyBuffer(vk.device,vk.rtProbeBuffer,nullptr);vk.rtProbeBuffer=VK_NULL_HANDLE;}
+            if(vk.rtProbeMemory){vkFreeMemory(vk.device,vk.rtProbeMemory,nullptr);vk.rtProbeMemory=VK_NULL_HANDLE;}
+        }else eprintf("*Vulkan RT: device-address probe 0x%llx\n",(unsigned long long)vk.rtProbeAddress);
+    }
     VkDescriptorSetLayoutBinding bindings[4]={{0,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,1,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{2,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{3,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};li.bindingCount=4;li.pBindings=bindings;vkCreateDescriptorSetLayout(vk.device,&li,nullptr,&vk.setLayout);VkDescriptorPoolSize sizes[2]={{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,kMaxTextures},{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,kMaxTextures*3+8}};VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};dpi.maxSets=kMaxTextures+8;dpi.poolSizeCount=2;dpi.pPoolSizes=sizes;vkCreateDescriptorPool(vk.device,&dpi,nullptr,&vk.descriptorPool);VkPushConstantRange overlayPush{VK_SHADER_STAGE_VERTEX_BIT,0,sizeof(OverlayConstants)};VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};pli.setLayoutCount=1;pli.pSetLayouts=&vk.setLayout;pli.pushConstantRangeCount=1;pli.pPushConstantRanges=&overlayPush;vkCreatePipelineLayout(vk.device,&pli,nullptr,&vk.pipelineLayout);VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};sci.magFilter=VK_FILTER_NEAREST;sci.minFilter=VK_FILTER_NEAREST;sci.addressModeU=sci.addressModeV=sci.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;sci.maxLod=1;vkCreateSampler(vk.device,&sci,nullptr,&vk.nearestSampler);sci.magFilter=sci.minFilter=VK_FILTER_LINEAR;vkCreateSampler(vk.device,&sci,nullptr,&vk.linearSampler);vk.vert=Shader(g_psx_vert_spv,sizeof(g_psx_vert_spv));vk.frag=Shader(g_psx_frag_spv,sizeof(g_psx_frag_spv));vk.shadowVert=Shader(g_shadow_vert_spv,sizeof(g_shadow_vert_spv));vk.overlayVert=Shader(g_overlay_vert_spv,sizeof(g_overlay_vert_spv));vk.overlayFrag=Shader(g_overlay_frag_spv,sizeof(g_overlay_frag_spv));vk.lineVert=Shader(g_line_vert_spv,sizeof(g_line_vert_spv));vk.lineFrag=Shader(g_line_frag_spv,sizeof(g_line_frag_spv));CreateBuffer(kOverlayUploadBytes,VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,vk.overlayUpload,vk.overlayUploadMemory,&vk.overlayUploadMap);CreateBuffer(kOverlayLineBytes,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,vk.overlayLines,vk.overlayLineMemory,&vk.overlayLineMap);CreateOverlayPipelines();EnsureShadowTarget();
     g_vramTexture=vk.nextTexture++;UploadTexture(vk.textures[g_vramTexture],vram,sizeof(vram),VK_FORMAT_R8G8_UNORM,VRAM_WIDTH,VRAM_HEIGHT);UpdateDescriptor(g_vramTexture);uint32_t white=0xffffffff;g_whiteTexture=vk.nextTexture++;UploadTexture(vk.textures[g_whiteTexture],&white,4,VK_FORMAT_R8G8B8A8_UNORM,1,1);UpdateDescriptor(g_whiteTexture);vk.framebufferTexture=vk.nextTexture++;std::vector<uint8_t> fbZero((size_t)VRAM_WIDTH*VRAM_HEIGHT*4);UploadTexture(vk.textures[vk.framebufferTexture],fbZero.data(),fbZero.size(),VK_FORMAT_R8G8B8A8_UNORM,VRAM_WIDTH,VRAM_HEIGHT);UpdateDescriptor(vk.framebufferTexture);EnsureOffscreenTarget();UpdateDescriptor(g_vramTexture);UpdateDescriptor(g_whiteTexture);CreateBuffer(sizeof(vram),VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,vk.vramStaging,vk.vramStagingMemory,&vk.vramStagingMap);CreateBuffer((VkDeviceSize)VRAM_WIDTH*VRAM_HEIGHT*4,VK_BUFFER_USAGE_TRANSFER_DST_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,vk.framebufferReadback,vk.framebufferReadbackMemory,&vk.framebufferReadbackMap);vk.boundTexture=g_vramTexture;Ortho(0,320,240,0,-1,1);GR_InitPostProcess();return 1;}
 
@@ -690,6 +810,7 @@ void GR_Shutdown(){
     if(vk.framebufferReadbackMap)vkUnmapMemory(vk.device,vk.framebufferReadbackMemory);if(vk.framebufferReadback)vkDestroyBuffer(vk.device,vk.framebufferReadback,nullptr);if(vk.framebufferReadbackMemory)vkFreeMemory(vk.device,vk.framebufferReadbackMemory,nullptr);
     if(vk.overlayUploadMap)vkUnmapMemory(vk.device,vk.overlayUploadMemory);if(vk.overlayUpload)vkDestroyBuffer(vk.device,vk.overlayUpload,nullptr);if(vk.overlayUploadMemory)vkFreeMemory(vk.device,vk.overlayUploadMemory,nullptr);
     if(vk.overlayLineMap)vkUnmapMemory(vk.device,vk.overlayLineMemory);if(vk.overlayLines)vkDestroyBuffer(vk.device,vk.overlayLines,nullptr);if(vk.overlayLineMemory)vkFreeMemory(vk.device,vk.overlayLineMemory,nullptr);
+    if(vk.rtProbeBuffer)vkDestroyBuffer(vk.device,vk.rtProbeBuffer,nullptr);if(vk.rtProbeMemory)vkFreeMemory(vk.device,vk.rtProbeMemory,nullptr);
     vkDestroySemaphore(vk.device,vk.acquired,nullptr);vkDestroySemaphore(vk.device,vk.complete,nullptr);vkDestroyFence(vk.device,vk.fence,nullptr);vkDestroyCommandPool(vk.device,vk.commandPool,nullptr);vkDestroyDevice(vk.device,nullptr);vkDestroySurfaceKHR(vk.instance,vk.surface,nullptr);vkDestroyInstance(vk.instance,nullptr);vk=VulkanState{};
 }
 void GR_ResetDevice(){vk.recreate=true;} void GR_UpdateSwapIntervalState(int interval){int normalized=interval>0?1:0;if(vk.swapInterval!=normalized){vk.swapInterval=normalized;vk.recreate=true;}}

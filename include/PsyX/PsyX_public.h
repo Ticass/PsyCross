@@ -75,6 +75,13 @@ extern int							g_cfg_pgxpTextureCorrection;
  * be set BEFORE PsyX_Initialise — it drives the SDL multisample GL attributes at
  * context-creation time. */
 extern int							g_cfg_msaaSamples;
+/* Hardware ray-query/acceleration-structure foundation. The runtime option is
+ * harmless on OpenGL and unsupported Vulkan devices; query the functions below
+ * before creating any RT resources. */
+extern int                          g_cfg_rtgi;
+extern int                          GR_RayTracingAvailable(void);
+extern int                          GR_RayTracingEnabled(void);
+extern const char*                  GR_RayTracingStatus(void);
 
 /* PC port: full-screen post-process look (0 = off, 1.. = a built-in filter).
  * Safe to change at runtime (launcher config + F2 in-game cycle). */
