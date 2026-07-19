@@ -225,6 +225,8 @@ struct VulkanState {
     VkRect2D framebufferReadPendingRects[kFramebufferRegions]{};
     VkRect2D framebufferReadReadyRects[kFramebufferRegions]{};
     uint32_t framebufferReadPendingCount = 0, framebufferReadReadyCount = 0;
+    VkRect2D displayFramebufferRect{};
+    bool displayFramebufferRectValid = false;
     VkRect2D framebufferRects[kFramebufferRegions]{};
     uint32_t framebufferRectCount = 0, framebufferRectCursor = 0;
     RECT16 offscreenRect{};
@@ -256,6 +258,18 @@ static void RememberFramebufferRect(int x,int y,int w,int h) {
     vk.framebufferStoreValid=true;
 }
 
+/* The normal display feedback buffer is a single moving VRAM rectangle.  The
+ * OpenGL backend's g_PreviousFramebuffer replaces it on every store; retaining
+ * both alternating display pages makes unrelated textures that later occupy an
+ * old page sample stale screen imagery.  Offscreen render targets are tracked
+ * separately above because more than one of those may remain resident. */
+static void RememberDisplayFramebufferRect(int x,int y,int w,int h) {
+    if(w<=0||h<=0){vk.displayFramebufferRectValid=false;return;}
+    vk.displayFramebufferRect={{x,y},{(uint32_t)w,(uint32_t)h}};
+    vk.displayFramebufferRectValid=true;
+    vk.framebufferStoreValid=true;
+}
+
 static void QueueFramebufferReadRect(int x,int y,int w,int h) {
     if(w<=0||h<=0)return;
     for(uint32_t i=0;i<vk.framebufferReadPendingCount;i++){
@@ -268,6 +282,8 @@ static void QueueFramebufferReadRect(int x,int y,int w,int h) {
 static void InvalidateFramebufferRects(int x,int y,int w,int h){
     if(w<=0||h<=0)return;
     for(uint32_t i=0;i<vk.framebufferRectCount;){const VkRect2D& r=vk.framebufferRects[i];bool overlap=x<(int)(r.offset.x+r.extent.width)&&x+w>r.offset.x&&y<(int)(r.offset.y+r.extent.height)&&y+h>r.offset.y;if(overlap)vk.framebufferRects[i]=vk.framebufferRects[--vk.framebufferRectCount];else i++;}vk.framebufferStoreValid=vk.framebufferRectCount>0;
+    if(vk.displayFramebufferRectValid){const VkRect2D& r=vk.displayFramebufferRect;bool overlap=x<(int)(r.offset.x+r.extent.width)&&x+w>r.offset.x&&y<(int)(r.offset.y+r.extent.height)&&y+h>r.offset.y;if(overlap)vk.displayFramebufferRectValid=false;}
+    vk.framebufferStoreValid=vk.displayFramebufferRectValid||vk.framebufferRectCount>0;
 }
 
 static uint32_t FindMemory(uint32_t bits, VkMemoryPropertyFlags flags) {
@@ -556,7 +572,7 @@ static void FlushPreOverlayCopies(){
     Transition(vk.command,vk.images[vk.imageIndex],VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     if(vk.framebufferStoreRequested&&vk.framebufferTexture&&vk.textures[vk.framebufferTexture].alive){
         Texture& fb=vk.textures[vk.framebufferTexture];Transition(vk.command,fb.image,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);VkImageBlit blit{};blit.srcSubresource.aspectMask=blit.dstSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;blit.srcSubresource.layerCount=blit.dstSubresource.layerCount=1;blit.srcOffsets[1]={(int32_t)vk.extent.width,(int32_t)vk.extent.height,1};int x=vk.framebufferRect.offset.x,y=vk.framebufferRect.offset.y,w=(int)vk.framebufferRect.extent.width,h=(int)vk.framebufferRect.extent.height;blit.dstOffsets[0]={x,y+h,0};blit.dstOffsets[1]={x+w,y,1};vkCmdBlitImage(vk.command,vk.images[vk.imageIndex],VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,fb.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_NEAREST);
-        if(vk.framebufferReadback){Transition(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);VkBufferImageCopy read{};read.bufferOffset=((VkDeviceSize)y*VRAM_WIDTH+x)*4;read.bufferRowLength=VRAM_WIDTH;read.bufferImageHeight=VRAM_HEIGHT;read.imageSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;read.imageSubresource.layerCount=1;read.imageOffset={x,y,0};read.imageExtent={(uint32_t)w,(uint32_t)h,1};vkCmdCopyImageToBuffer(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,vk.framebufferReadback,1,&read);Transition(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);QueueFramebufferReadRect(x,y,w,h);}else Transition(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);RememberFramebufferRect(x,y,w,h);
+        if(vk.framebufferReadback){Transition(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);VkBufferImageCopy read{};read.bufferOffset=((VkDeviceSize)y*VRAM_WIDTH+x)*4;read.bufferRowLength=VRAM_WIDTH;read.bufferImageHeight=VRAM_HEIGHT;read.imageSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;read.imageSubresource.layerCount=1;read.imageOffset={x,y,0};read.imageExtent={(uint32_t)w,(uint32_t)h,1};vkCmdCopyImageToBuffer(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,vk.framebufferReadback,1,&read);Transition(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);QueueFramebufferReadRect(x,y,w,h);}else Transition(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);RememberDisplayFramebufferRect(x,y,w,h);
     }
     if(vk.captureRequested&&vk.captureTexture&&vk.textures[vk.captureTexture].alive){Texture& c=vk.textures[vk.captureTexture];Transition(vk.command,c.image,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);VkImageCopy copy{};copy.srcSubresource.aspectMask=copy.dstSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;copy.srcSubresource.layerCount=copy.dstSubresource.layerCount=1;copy.extent={vk.extent.width,vk.extent.height,1};vkCmdCopyImage(vk.command,vk.images[vk.imageIndex],VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,c.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);Transition(vk.command,c.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);vk.captureValid=true;}
     Transition(vk.command,vk.images[vk.imageIndex],VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);vk.framebufferStoreRequested=false;vk.captureRequested=false;ResumeMainPass();
@@ -646,7 +662,7 @@ void GR_SwapWindow(){
         VkImageBlit blit{};blit.srcSubresource.aspectMask=blit.dstSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;blit.srcSubresource.layerCount=blit.dstSubresource.layerCount=1;blit.srcOffsets[1]={(int32_t)vk.extent.width,(int32_t)vk.extent.height,1};
         int x=vk.framebufferRect.offset.x,y=vk.framebufferRect.offset.y,w=(int)vk.framebufferRect.extent.width,h=(int)vk.framebufferRect.extent.height;blit.dstOffsets[0]={x,y+h,0};blit.dstOffsets[1]={x+w,y,1};
         vkCmdBlitImage(vk.command,vk.images[vk.imageIndex],VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,fb.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_NEAREST);
-        if(vk.framebufferReadback){Transition(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);VkBufferImageCopy read{};read.bufferOffset=((VkDeviceSize)y*VRAM_WIDTH+x)*4;read.bufferRowLength=VRAM_WIDTH;read.bufferImageHeight=VRAM_HEIGHT;read.imageSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;read.imageSubresource.layerCount=1;read.imageOffset={x,y,0};read.imageExtent={(uint32_t)w,(uint32_t)h,1};vkCmdCopyImageToBuffer(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,vk.framebufferReadback,1,&read);Transition(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);QueueFramebufferReadRect(x,y,w,h);}else Transition(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);RememberFramebufferRect(x,y,w,h);
+        if(vk.framebufferReadback){Transition(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);VkBufferImageCopy read{};read.bufferOffset=((VkDeviceSize)y*VRAM_WIDTH+x)*4;read.bufferRowLength=VRAM_WIDTH;read.bufferImageHeight=VRAM_HEIGHT;read.imageSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;read.imageSubresource.layerCount=1;read.imageOffset={x,y,0};read.imageExtent={(uint32_t)w,(uint32_t)h,1};vkCmdCopyImageToBuffer(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,vk.framebufferReadback,1,&read);Transition(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);QueueFramebufferReadRect(x,y,w,h);}else Transition(vk.command,fb.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);RememberDisplayFramebufferRect(x,y,w,h);
     }
     if(vk.captureRequested&&vk.captureTexture&&vk.textures[vk.captureTexture].alive){Texture& c=vk.textures[vk.captureTexture];Transition(vk.command,c.image,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);VkImageCopy copy{};copy.srcSubresource.aspectMask=copy.dstSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;copy.srcSubresource.layerCount=copy.dstSubresource.layerCount=1;copy.extent={vk.extent.width,vk.extent.height,1};vkCmdCopyImage(vk.command,vk.images[vk.imageIndex],VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,c.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);Transition(vk.command,c.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);vk.captureValid=true;}
     if(vk.postRequested&&vk.postTexture.alive&&vk.postPipeline&&vk.postDescriptor){
@@ -711,7 +727,7 @@ void GR_SetOffscreenState(const RECT16* r,int e){
     }
 }
 
-void GR_SetTexture(TextureID id,TexFormat f){vk.texFormat=f;vk.boundTexture=(g_dbg_texturelessMode?g_whiteTexture:id);if(vk.boundTexture>=kMaxTextures||!vk.textures[vk.boundTexture].alive)vk.boundTexture=g_whiteTexture;memset(vk.uniforms.framebufferRects,0,sizeof(vk.uniforms.framebufferRects));for(uint32_t i=0;i<vk.framebufferRectCount;i++){const VkRect2D& r=vk.framebufferRects[i];vk.uniforms.framebufferRects[i][0]=(float)r.offset.x;vk.uniforms.framebufferRects[i][1]=(float)r.offset.y;vk.uniforms.framebufferRects[i][2]=(float)r.extent.width;vk.uniforms.framebufferRects[i][3]=(float)r.extent.height;}}
+void GR_SetTexture(TextureID id,TexFormat f){vk.texFormat=f;vk.boundTexture=(g_dbg_texturelessMode?g_whiteTexture:id);if(vk.boundTexture>=kMaxTextures||!vk.textures[vk.boundTexture].alive)vk.boundTexture=g_whiteTexture;memset(vk.uniforms.framebufferRects,0,sizeof(vk.uniforms.framebufferRects));uint32_t dst=0;if(vk.displayFramebufferRectValid){const VkRect2D& r=vk.displayFramebufferRect;vk.uniforms.framebufferRects[dst][0]=(float)r.offset.x;vk.uniforms.framebufferRects[dst][1]=(float)r.offset.y;vk.uniforms.framebufferRects[dst][2]=(float)r.extent.width;vk.uniforms.framebufferRects[dst][3]=(float)r.extent.height;dst++;}for(uint32_t i=0;i<vk.framebufferRectCount&&dst<kFramebufferRegions;i++,dst++){const VkRect2D& r=vk.framebufferRects[i];vk.uniforms.framebufferRects[dst][0]=(float)r.offset.x;vk.uniforms.framebufferRects[dst][1]=(float)r.offset.y;vk.uniforms.framebufferRects[dst][2]=(float)r.extent.width;vk.uniforms.framebufferRects[dst][3]=(float)r.extent.height;}}
 void GR_SetShader(ShaderID){} ShaderID GR_Shader_Compile(const char*){return 0;}
 TextureID GR_CreateRGBATexture(int w,int h,u_char* data){if(vk.nextTexture>=kMaxTextures)return 0;TextureID id=vk.nextTexture++;std::vector<uint8_t> zero;if(!data){zero.resize((size_t)w*h*4);data=zero.data();}UploadTexture(vk.textures[id],data,(size_t)w*h*4,VK_FORMAT_R8G8B8A8_UNORM,w,h);UpdateDescriptor(id);return id;}
 int GR_OverlayUploadRGBA(TextureID* texture,const unsigned char* rgba,int width,int height){
