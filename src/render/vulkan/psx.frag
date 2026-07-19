@@ -24,6 +24,17 @@ layout(set=0,binding=2) uniform sampler2D framebufferTexture;
 layout(set=0,binding=3) uniform sampler2D shadowTexture;
 #ifdef RTGI
 layout(set=1,binding=0) uniform accelerationStructureEXT sceneAccelerationStructure;
+struct RayMaterial {
+    vec4 uv01;
+    vec4 uv2Format;
+    vec4 pageClut;
+    vec4 color0;
+    vec4 color1;
+    vec4 color2;
+};
+layout(set=1,binding=1,std430) readonly buffer RayMaterials {
+    RayMaterial materials[];
+} rayScene;
 #endif
 
 layout(location=0) in vec4 vTexcoord;
@@ -89,23 +100,27 @@ float shadowLinearDepth(float windowDepth) {
     return (n * f) / max(f - windowDepth * (f - n), 1e-6);
 }
 
-float samplePSX(vec2 tc, int format) {
+float samplePSXAt(vec2 tc, int format, vec4 pageClut) {
     if (format == 0) {
-        vec2 comp = readVRAM((tc * vec2(0.25, 1.0) + vPageClut.xy) * VRAM_TEXEL);
+        vec2 comp = readVRAM((tc * vec2(0.25, 1.0) + pageClut.xy) * VRAM_TEXEL);
         int nibble = int(fract(tc.x / 4.0 + 0.0001) * 4.0);
         float value = comp[nibble / 2] * (255.001 / 16.0);
         float lo = fract(value) * 16.0;
         float hi = floor(value);
         float index = ((nibble & 1) == 0) ? lo : hi;
-        vec2 clutUv = vPageClut.zw + vec2(index * VRAM_TEXEL.x, 0.0);
+        vec2 clutUv = pageClut.zw + vec2(index * VRAM_TEXEL.x, 0.0);
         return packRG(readVRAM(clutUv));
     }
     if (format == 1) {
-        vec2 comp = readVRAM((tc * vec2(0.5, 1.0) + vPageClut.xy) * VRAM_TEXEL);
+        vec2 comp = readVRAM((tc * vec2(0.5, 1.0) + pageClut.xy) * VRAM_TEXEL);
         float index = comp[int(mod(tc.x, 2.0))] * 255.001;
-        return packRG(readVRAM(vPageClut.zw + vec2(index * VRAM_TEXEL.x, 0.0)));
+        return packRG(readVRAM(pageClut.zw + vec2(index * VRAM_TEXEL.x, 0.0)));
     }
-    return packRG(readVRAM((tc + vPageClut.xy) * VRAM_TEXEL));
+    return packRG(readVRAM((tc + pageClut.xy) * VRAM_TEXEL));
+}
+
+float samplePSX(vec2 tc, int format) {
+    return samplePSXAt(tc, format, vPageClut);
 }
 
 vec4 sampleNative(vec2 tc, int format) {
@@ -126,6 +141,42 @@ vec4 sampleNative(vec2 tc, int format) {
     if (packed == 0.0) discard;
     return decode1555(packed);
 }
+
+#ifdef RTGI
+bool traceReflection(vec3 origin, vec3 direction, float maximumDistance, out vec3 radiance) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, sceneAccelerationStructure, gl_RayFlagsOpaqueEXT,
+                          0xff, origin, 6.0, direction, maximumDistance);
+    while (rayQueryProceedEXT(query)) {}
+    if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT)
+        return false;
+
+    uint primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+    vec2 bary12 = rayQueryGetIntersectionBarycentricsEXT(query, true);
+    vec3 bary = vec3(1.0 - bary12.x - bary12.y, bary12.x, bary12.y);
+    RayMaterial material = rayScene.materials[primitive];
+    vec2 uv = material.uv01.xy * bary.x + material.uv01.zw * bary.y +
+              material.uv2Format.xy * bary.z;
+    vec3 vertexColor = material.color0.rgb * bary.x + material.color1.rgb * bary.y +
+                       material.color2.rgb * bary.z;
+    int format = int(material.uv2Format.z + 0.5);
+    vec4 texel = format <= 2 ? decode1555(samplePSXAt(uv, format, material.pageClut))
+                             : vec4(1.0);
+    radiance = texel.rgb * vertexColor;
+    return true;
+}
+
+float inferredMetalness(vec3 albedo) {
+    float high = max(albedo.r, max(albedo.g, albedo.b));
+    float low = min(albedo.r, min(albedo.g, albedo.b));
+    float saturation = (high - low) / max(high, 0.08);
+    float luminance = dot(albedo, vec3(0.2126, 0.7152, 0.0722));
+    /* Silent Hill has no material channel. Neutral, mid-value painted surfaces
+     * are the safest proxy for steel; dark cloth and bright plaster stay rough. */
+    return (1.0 - smoothstep(0.12, 0.38, saturation)) *
+           smoothstep(0.16, 0.42, luminance) * (1.0 - smoothstep(0.82, 0.98, luminance));
+}
+#endif
 
 void main() {
     int format = int(ubo.hiresInfo.w + 0.5);
@@ -167,6 +218,19 @@ void main() {
         color.rgb *= mix(0.68, 1.0, bounceVisibility);
         vec3 ambientBounce = max(ubo.fogColorStrength.rgb, vec3(0.035));
         color.rgb += albedo * ambientBounce * (0.12 * bounceVisibility);
+
+        float metalness = inferredMetalness(albedo);
+        if (metalness > 0.03) {
+            vec3 viewDirection = normalize(-vViewPos);
+            vec3 reflectionDirection = normalize(reflect(-viewDirection, normal));
+            vec3 reflectedColor;
+            bool reflectionHit = traceReflection(rayOrigin, reflectionDirection, 2400.0, reflectedColor);
+            if (!reflectionHit)
+                reflectedColor = max(ubo.fogColorStrength.rgb, vec3(0.025));
+            float fresnel = 0.08 + 0.92 * pow(1.0 - max(dot(normal, viewDirection), 0.0), 5.0);
+            float reflectionWeight = metalness * mix(0.18, 0.58, fresnel);
+            color.rgb = mix(color.rgb, reflectedColor * 1.35, reflectionWeight);
+        }
     }
 #endif
     if (ubo.effectInfo.x > 0.5 && vViewPos.z > 0.0) {
@@ -242,6 +306,22 @@ void main() {
         shadow *= rayVisibility(vViewPos + rtNormal * 6.0, L, max(distanceToLight - 10.0, 0.0));
 #endif
         color.rgb += albedo * ubo.lightColor.rgb * cone * attenuation * ndl * shadow;
+#ifdef RTGI
+        /* A visible flashlight response on painted metal. The visibility term
+         * is the same hardware ray used by the diffuse beam, so highlights are
+         * correctly removed when an object blocks the light. */
+        float metalness = inferredMetalness(albedo);
+        if (metalness > 0.03) {
+            vec3 N = surfaceNormal(vViewPos);
+            vec3 V = normalize(-vViewPos);
+            vec3 H = normalize(L + V);
+            float specularPower = mix(28.0, 112.0, metalness);
+            float specular = pow(max(dot(N, H), 0.0), specularPower);
+            float fresnel = 0.12 + 0.88 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
+            color.rgb += ubo.lightColor.rgb * cone * attenuation * shadow *
+                         specular * metalness * mix(0.55, 1.5, fresnel);
+        }
+#endif
     }
     float fog = clamp(vFog * ubo.fogColorStrength.a, 0.0, 1.0);
     if (ubo.effectInfo.z > 0.5) color.rgb *= 1.0 - fog;

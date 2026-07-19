@@ -78,6 +78,7 @@ constexpr VkDeviceSize kVertexBytes = sizeof(GrVertex) * MAX_VERTEX_BUFFER_SIZE;
 constexpr uint32_t kUniformSlots = 8192;
 constexpr uint32_t kFramebufferRegions = 8;
 constexpr uint32_t kShadowMapSize = 1024;
+constexpr uint32_t kMaxRayTriangles = 131072;
 constexpr VkDeviceSize kOverlayUploadBytes = 8u * 1024u * 1024u;
 constexpr VkDeviceSize kOverlayLineBytes = 1024u * 1024u;
 
@@ -122,10 +123,22 @@ struct PipelineKey {
 struct PipelineEntry { PipelineKey key{}; VkPipeline pipeline = VK_NULL_HANDLE; };
 struct VertexSlice { VkBuffer buffer=VK_NULL_HANDLE;VkDeviceMemory memory=VK_NULL_HANDLE;void* mapped=nullptr;uint32_t vertexCount=0; };
 
+/* std430-compatible material payload indexed by the BLAS primitive number.
+ * This lets a ray-query hit reconstruct the PS1 texture/palette lookup rather
+ * than returning a generic environment colour. */
+struct RayMaterial {
+    float uv01[4];
+    float uv2Format[4];
+    float pageClut[4];
+    float color0[4];
+    float color1[4];
+    float color2[4];
+};
+
 struct RayScene {
-    VkBuffer geometryBuffer=VK_NULL_HANDLE,blasBuffer=VK_NULL_HANDLE,blasScratch=VK_NULL_HANDLE;
+    VkBuffer geometryBuffer=VK_NULL_HANDLE,materialBuffer=VK_NULL_HANDLE,blasBuffer=VK_NULL_HANDLE,blasScratch=VK_NULL_HANDLE;
     VkBuffer instanceBuffer=VK_NULL_HANDLE,tlasBuffer=VK_NULL_HANDLE,tlasScratch=VK_NULL_HANDLE;
-    VkDeviceMemory geometryMemory=VK_NULL_HANDLE,blasMemory=VK_NULL_HANDLE,blasScratchMemory=VK_NULL_HANDLE;
+    VkDeviceMemory geometryMemory=VK_NULL_HANDLE,materialMemory=VK_NULL_HANDLE,blasMemory=VK_NULL_HANDLE,blasScratchMemory=VK_NULL_HANDLE;
     VkDeviceMemory instanceMemory=VK_NULL_HANDLE,tlasMemory=VK_NULL_HANDLE,tlasScratchMemory=VK_NULL_HANDLE;
     VkAccelerationStructureKHR blas=VK_NULL_HANDLE,tlas=VK_NULL_HANDLE;
     uint32_t triangleCount=0;
@@ -211,6 +224,7 @@ struct VulkanState {
     uint32_t vertexSliceIndex = 0;
     VertexSlice* currentVertexSlice = nullptr;
     std::vector<float> rtFramePositions;
+    std::vector<RayMaterial> rtFrameMaterials;
     RayScene rtCurrent{},rtPending{};
     bool rtPromotionPending = false;
     VkDescriptorSet rtDescriptor = VK_NULL_HANDLE;
@@ -373,8 +387,8 @@ static bool CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPr
 static void DestroyRayScene(RayScene& scene) {
     if(scene.tlas)vk.destroyAccelerationStructure(vk.device,scene.tlas,nullptr);
     if(scene.blas)vk.destroyAccelerationStructure(vk.device,scene.blas,nullptr);
-    VkBuffer buffers[]={scene.geometryBuffer,scene.blasBuffer,scene.blasScratch,scene.instanceBuffer,scene.tlasBuffer,scene.tlasScratch};
-    VkDeviceMemory memories[]={scene.geometryMemory,scene.blasMemory,scene.blasScratchMemory,scene.instanceMemory,scene.tlasMemory,scene.tlasScratchMemory};
+    VkBuffer buffers[]={scene.geometryBuffer,scene.materialBuffer,scene.blasBuffer,scene.blasScratch,scene.instanceBuffer,scene.tlasBuffer,scene.tlasScratch};
+    VkDeviceMemory memories[]={scene.geometryMemory,scene.materialMemory,scene.blasMemory,scene.blasScratchMemory,scene.instanceMemory,scene.tlasMemory,scene.tlasScratchMemory};
     for(VkBuffer buffer:buffers)if(buffer)vkDestroyBuffer(vk.device,buffer,nullptr);
     for(VkDeviceMemory memory:memories)if(memory)vkFreeMemory(vk.device,memory,nullptr);
     scene=RayScene{};
@@ -390,7 +404,9 @@ static void PromoteRayScene() {
     DestroyRayScene(vk.rtCurrent);vk.rtCurrent=vk.rtPending;vk.rtPending=RayScene{};vk.rtPromotionPending=false;
     if(vk.rtCurrent.tlas&&vk.rtDescriptor){
         VkWriteDescriptorSetAccelerationStructureKHR accelerationWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};accelerationWrite.accelerationStructureCount=1;accelerationWrite.pAccelerationStructures=&vk.rtCurrent.tlas;
-        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};write.pNext=&accelerationWrite;write.dstSet=vk.rtDescriptor;write.dstBinding=0;write.descriptorCount=1;write.descriptorType=VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;vkUpdateDescriptorSets(vk.device,1,&write,0,nullptr);
+        VkDescriptorBufferInfo materialInfo{vk.rtCurrent.materialBuffer,0,VK_WHOLE_SIZE};
+        VkWriteDescriptorSet writes[2]{};writes[0].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;writes[0].pNext=&accelerationWrite;writes[0].dstSet=vk.rtDescriptor;writes[0].dstBinding=0;writes[0].descriptorCount=1;writes[0].descriptorType=VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        writes[1].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;writes[1].dstSet=vk.rtDescriptor;writes[1].dstBinding=1;writes[1].descriptorCount=1;writes[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;writes[1].pBufferInfo=&materialInfo;vkUpdateDescriptorSets(vk.device,2,writes,0,nullptr);
     }
 }
 
@@ -398,7 +414,7 @@ static bool BuildRaySceneForNextFrame(VkCommandBuffer command) {
     vk.rtPromotionPending=true;
     if(!g_cfg_rtgi||!vk.rayQueryAvailable||vk.rtFramePositions.size()<9)return false;
     DestroyRayScene(vk.rtPending);RayScene& scene=vk.rtPending;
-    const uint64_t requestedTriangles=vk.rtFramePositions.size()/9;
+    const uint64_t requestedTriangles=std::min(vk.rtFramePositions.size()/9,vk.rtFrameMaterials.size());
     const uint64_t maximumTriangles=std::max<uint64_t>(1,vk.accelerationProperties.maxPrimitiveCount);
     scene.triangleCount=(uint32_t)std::min(requestedTriangles,maximumTriangles);
     static bool firstSceneLogged=false;if(!firstSceneLogged){eprintf("*Vulkan RT: building live scene (%u triangles, one-frame history)\n",scene.triangleCount);firstSceneLogged=true;}
@@ -406,6 +422,9 @@ static bool BuildRaySceneForNextFrame(VkCommandBuffer command) {
     void* geometryMap=nullptr;
     if(!CreateBuffer(geometryBytes,VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,scene.geometryBuffer,scene.geometryMemory,&geometryMap,true))return false;
     memcpy(geometryMap,vk.rtFramePositions.data(),(size_t)geometryBytes);vkUnmapMemory(vk.device,scene.geometryMemory);
+    const VkDeviceSize materialBytes=(VkDeviceSize)scene.triangleCount*sizeof(RayMaterial);void* materialMap=nullptr;
+    if(!CreateBuffer(materialBytes,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,scene.materialBuffer,scene.materialMemory,&materialMap)){DestroyRayScene(scene);return false;}
+    memcpy(materialMap,vk.rtFrameMaterials.data(),(size_t)materialBytes);vkUnmapMemory(vk.device,scene.materialMemory);
     VkAccelerationStructureGeometryTrianglesDataKHR triangles{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR};triangles.vertexFormat=VK_FORMAT_R32G32B32_SFLOAT;triangles.vertexData.deviceAddress=BufferAddress(scene.geometryBuffer);triangles.vertexStride=3*sizeof(float);triangles.maxVertex=scene.triangleCount*3-1;
     VkAccelerationStructureGeometryKHR geometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};geometry.geometryType=VK_GEOMETRY_TYPE_TRIANGLES_KHR;geometry.flags=VK_GEOMETRY_OPAQUE_BIT_KHR;geometry.geometry.triangles=triangles;
     VkAccelerationStructureBuildGeometryInfoKHR blasBuild{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};blasBuild.type=VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;blasBuild.flags=VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;blasBuild.mode=VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;blasBuild.geometryCount=1;blasBuild.pGeometries=&geometry;
@@ -708,7 +727,7 @@ static bool InitDevice() {
             vk.rayQueryAvailable=false;snprintf(vk.rayStatus,sizeof(vk.rayStatus),"unavailable (driver entry points missing)");
         }else{
             VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};properties.pNext=&vk.accelerationProperties;vkGetPhysicalDeviceProperties2(vk.physical,&properties);
-            snprintf(vk.rayStatus,sizeof(vk.rayStatus),"hardware RT ready (ray-query GI/contact shadows)");
+            snprintf(vk.rayStatus,sizeof(vk.rayStatus),"hardware RT ready (textured reflections/GI/flashlight shadows)");
             eprintf("*Vulkan RT: %s, max AS geometries %llu\n",vk.rayStatus,(unsigned long long)vk.accelerationProperties.maxGeometryCount);
         }
     }
@@ -820,8 +839,8 @@ int GR_InitialisePSX(){memset(vram,0,sizeof(vram));VkPhysicalDeviceProperties p{
         }else eprintf("*Vulkan RT: device-address probe 0x%llx\n",(unsigned long long)vk.rtProbeAddress);
     }
     VkDescriptorSetLayoutBinding bindings[4]={{0,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,1,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{2,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{3,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};li.bindingCount=4;li.pBindings=bindings;vkCreateDescriptorSetLayout(vk.device,&li,nullptr,&vk.setLayout);
-    if(vk.rayQueryAvailable){VkDescriptorSetLayoutBinding rtBinding{0,VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};VkDescriptorSetLayoutCreateInfo rtLayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};rtLayoutInfo.bindingCount=1;rtLayoutInfo.pBindings=&rtBinding;if(!Check(vkCreateDescriptorSetLayout(vk.device,&rtLayoutInfo,nullptr,&vk.rtSetLayout),"RT descriptor layout"))vk.rayQueryAvailable=false;}
-    VkDescriptorPoolSize sizes[3]={{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,kMaxTextures},{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,kMaxTextures*3+8},{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1}};VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};dpi.maxSets=kMaxTextures+9;dpi.poolSizeCount=vk.rayQueryAvailable?3u:2u;dpi.pPoolSizes=sizes;vkCreateDescriptorPool(vk.device,&dpi,nullptr,&vk.descriptorPool);
+    if(vk.rayQueryAvailable){VkDescriptorSetLayoutBinding rtBindings[2]={{0,VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};VkDescriptorSetLayoutCreateInfo rtLayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};rtLayoutInfo.bindingCount=2;rtLayoutInfo.pBindings=rtBindings;if(!Check(vkCreateDescriptorSetLayout(vk.device,&rtLayoutInfo,nullptr,&vk.rtSetLayout),"RT descriptor layout"))vk.rayQueryAvailable=false;}
+    VkDescriptorPoolSize sizes[4]={{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,kMaxTextures},{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,kMaxTextures*3+8},{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1}};VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};dpi.maxSets=kMaxTextures+9;dpi.poolSizeCount=vk.rayQueryAvailable?4u:2u;dpi.pPoolSizes=sizes;vkCreateDescriptorPool(vk.device,&dpi,nullptr,&vk.descriptorPool);
     VkPushConstantRange overlayPush{VK_SHADER_STAGE_VERTEX_BIT,0,sizeof(OverlayConstants)};VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};pli.setLayoutCount=1;pli.pSetLayouts=&vk.setLayout;pli.pushConstantRangeCount=1;pli.pPushConstantRanges=&overlayPush;vkCreatePipelineLayout(vk.device,&pli,nullptr,&vk.pipelineLayout);
     if(vk.rayQueryAvailable&&vk.rtSetLayout){VkDescriptorSetLayout rtLayouts[]={vk.setLayout,vk.rtSetLayout};VkPipelineLayoutCreateInfo rtPipelineInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};rtPipelineInfo.setLayoutCount=2;rtPipelineInfo.pSetLayouts=rtLayouts;if(!Check(vkCreatePipelineLayout(vk.device,&rtPipelineInfo,nullptr,&vk.rtPipelineLayout),"RT pipeline layout"))vk.rayQueryAvailable=false;else{VkDescriptorSetAllocateInfo rtAllocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};rtAllocate.descriptorPool=vk.descriptorPool;rtAllocate.descriptorSetCount=1;rtAllocate.pSetLayouts=&vk.rtSetLayout;if(!Check(vkAllocateDescriptorSets(vk.device,&rtAllocate,&vk.rtDescriptor),"RT descriptor"))vk.rayQueryAvailable=false;}}
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};sci.magFilter=VK_FILTER_NEAREST;sci.minFilter=VK_FILTER_NEAREST;sci.addressModeU=sci.addressModeV=sci.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;sci.maxLod=1;vkCreateSampler(vk.device,&sci,nullptr,&vk.nearestSampler);sci.magFilter=sci.minFilter=VK_FILTER_LINEAR;vkCreateSampler(vk.device,&sci,nullptr,&vk.linearSampler);vk.vert=Shader(g_psx_vert_spv,sizeof(g_psx_vert_spv));vk.frag=Shader(g_psx_frag_spv,sizeof(g_psx_frag_spv));if(vk.rayQueryAvailable)vk.rtFrag=Shader(g_psx_rt_frag_spv,sizeof(g_psx_rt_frag_spv));vk.shadowVert=Shader(g_shadow_vert_spv,sizeof(g_shadow_vert_spv));vk.overlayVert=Shader(g_overlay_vert_spv,sizeof(g_overlay_vert_spv));vk.overlayFrag=Shader(g_overlay_frag_spv,sizeof(g_overlay_frag_spv));vk.lineVert=Shader(g_line_vert_spv,sizeof(g_line_vert_spv));vk.lineFrag=Shader(g_line_frag_spv,sizeof(g_line_frag_spv));CreateBuffer(kOverlayUploadBytes,VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,vk.overlayUpload,vk.overlayUploadMemory,&vk.overlayUploadMap);CreateBuffer(kOverlayLineBytes,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,vk.overlayLines,vk.overlayLineMemory,&vk.overlayLineMap);CreateOverlayPipelines();EnsureShadowTarget();
@@ -831,11 +850,11 @@ void GR_BeginScene(){
     if(vk.recreate){DestroySwapchain();if(!CreateSwapchain())return;vk.recreate=false;}
     if(!vk.swapchain)return;
     EnsureCaptureTexture();if(vk.postSetLayout)EnsurePostTarget();
-    vkWaitForFences(vk.device,1,&vk.fence,VK_TRUE,UINT64_MAX);DestroyRetiredTextures();PromoteRayScene();vk.rtFramePositions.clear();vk.currentVertexSlice=nullptr;
+    vkWaitForFences(vk.device,1,&vk.fence,VK_TRUE,UINT64_MAX);DestroyRetiredTextures();PromoteRayScene();vk.rtFramePositions.clear();vk.rtFrameMaterials.clear();vk.currentVertexSlice=nullptr;
     /* Headless/automated validation hook: seed one harmless view-space triangle
      * so device creation, BLAS/TLAS build, descriptor binding and the RT shader
      * can all be exercised without navigating from the title into gameplay. */
-    static int rtSmoke=-1;if(rtSmoke<0)rtSmoke=getenv("PSYX_RT_SMOKE")?1:0;if(rtSmoke&&g_cfg_rtgi&&vk.rayQueryAvailable){const float triangle[]={-64.0f,-64.0f,512.0f,64.0f,-64.0f,512.0f,0.0f,64.0f,512.0f};vk.rtFramePositions.assign(triangle,triangle+9);}
+    static int rtSmoke=-1;if(rtSmoke<0)rtSmoke=getenv("PSYX_RT_SMOKE")?1:0;if(rtSmoke&&g_cfg_rtgi&&vk.rayQueryAvailable){const float triangle[]={-64.0f,-64.0f,512.0f,64.0f,-64.0f,512.0f,0.0f,64.0f,512.0f};vk.rtFramePositions.assign(triangle,triangle+9);RayMaterial material{};material.color0[0]=material.color0[1]=material.color0[2]=material.color0[3]=1.0f;memcpy(material.color1,material.color0,sizeof(material.color0));memcpy(material.color2,material.color0,sizeof(material.color0));vk.rtFrameMaterials.push_back(material);}
     for(uint32_t i=0;i<vk.framebufferReadPendingCount&&vk.framebufferReadReadyCount<kFramebufferRegions;i++)vk.framebufferReadReadyRects[vk.framebufferReadReadyCount++]=vk.framebufferReadPendingRects[i];
     vk.framebufferReadPendingCount=0;vk.overlayUploadCursor=0;vk.overlayPassSuspended=false;vk.vertexSliceIndex=0;
     VkResult ar=vkAcquireNextImageKHR(vk.device,vk.swapchain,UINT64_MAX,vk.acquired,VK_NULL_HANDLE,&vk.imageIndex);
@@ -961,8 +980,52 @@ void GR_SetOverrideTextureSize(int w,int h,int ox,int oy,int hw,int hh){vk.unifo
 void GR_UpdateVertexBuffer(const GrVertex* v,int n){
     if(!v||n<=0||!vk.recording)return;if(vk.vertexSliceIndex>=vk.vertexSlices.size()){VertexSlice slice{};if(!CreateBuffer(kVertexBytes,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,slice.buffer,slice.memory,&slice.mapped))return;vk.vertexSlices.push_back(slice);eprintf("*Vulkan vertex pool expanded to %u batches\n",(unsigned)vk.vertexSlices.size());}VertexSlice& slice=vk.vertexSlices[vk.vertexSliceIndex++];slice.vertexCount=(uint32_t)std::min(n,MAX_VERTEX_BUFFER_SIZE);memcpy(slice.mapped,v,(size_t)slice.vertexCount*sizeof(GrVertex));vk.currentVertexSlice=&slice;VkDeviceSize offset=0;vkCmdBindVertexBuffers(vk.command,0,1,&slice.buffer,&offset);
 }
+
+static void CaptureRayTriangle(const GrVertex* vertex)
+{
+    if(vk.rtFrameMaterials.size()>=kMaxRayTriangles)return;
+    for(int i=0;i<3;i++){
+        if(vertex[i].ny<0.5f||vertex[i].nx>0.5f||
+           !std::isfinite(vertex[i].vsx)||!std::isfinite(vertex[i].vsy)||!std::isfinite(vertex[i].vsz)||
+           std::abs(vertex[i].vsx)>1000000.0f||std::abs(vertex[i].vsy)>1000000.0f||std::abs(vertex[i].vsz)>1000000.0f)return;
+    }
+    const float ax=vertex[1].vsx-vertex[0].vsx,ay=vertex[1].vsy-vertex[0].vsy,az=vertex[1].vsz-vertex[0].vsz;
+    const float bx=vertex[2].vsx-vertex[0].vsx,by=vertex[2].vsy-vertex[0].vsy,bz=vertex[2].vsz-vertex[0].vsz;
+    const float cx=ay*bz-az*by,cy=az*bx-ax*bz,cz=ax*by-ay*bx;
+    if(cx*cx+cy*cy+cz*cz<1.0e-6f)return;
+
+    for(int i=0;i<3;i++){
+        vk.rtFramePositions.push_back(vertex[i].vsx);
+        vk.rtFramePositions.push_back(vertex[i].vsy);
+        vk.rtFramePositions.push_back(vertex[i].vsz);
+    }
+
+    RayMaterial material{};
+    material.uv01[0]=(float)vertex[0].u+(float)vertex[0].tcx*0.5f;
+    material.uv01[1]=(float)vertex[0].v+(float)vertex[0].tcy*0.5f;
+    material.uv01[2]=(float)vertex[1].u+(float)vertex[1].tcx*0.5f;
+    material.uv01[3]=(float)vertex[1].v+(float)vertex[1].tcy*0.5f;
+    material.uv2Format[0]=(float)vertex[2].u+(float)vertex[2].tcx*0.5f;
+    material.uv2Format[1]=(float)vertex[2].v+(float)vertex[2].tcy*0.5f;
+    material.uv2Format[2]=(float)vk.texFormat;
+    const int page=vertex[0].page,clut=vertex[0].clut;
+    material.pageClut[0]=(float)(page&15)*64.0f+0.00025f;
+    material.pageClut[1]=(float)(page/16)*256.0f+0.00025f;
+    material.pageClut[2]=(float)(clut&63)/64.0f+0.00025f;
+    material.pageClut[3]=(float)(clut/64)/512.0f+0.00025f;
+    float* colors[3]={material.color0,material.color1,material.color2};
+    for(int i=0;i<3;i++){
+        const float bright=(float)vertex[i].bright;
+        colors[i][0]=(float)vertex[i].r*(bright/255.0f);
+        colors[i][1]=(float)vertex[i].g*(bright/255.0f);
+        colors[i][2]=(float)vertex[i].b*(bright/255.0f);
+        colors[i][3]=(float)vertex[i].a/255.0f;
+    }
+    vk.rtFrameMaterials.push_back(material);
+}
+
 void GR_DrawTriangles(int start,int tris){
-    if(!vk.recording||!tris)return;if(g_cfg_rtgi&&vk.rayQueryAvailable&&vk.currentVertexSlice&&vk.blend==BM_NONE&&!vk.inOffscreen){const GrVertex* source=(const GrVertex*)vk.currentVertexSlice->mapped;uint32_t first=(uint32_t)std::max(start,0),end=std::min<uint32_t>(first+(uint32_t)tris*3,vk.currentVertexSlice->vertexCount);for(uint32_t i=first;i+2<end;i+=3){if(source[i].ny<0.5f||source[i+1].ny<0.5f||source[i+2].ny<0.5f||source[i].nx>0.5f||source[i+1].nx>0.5f||source[i+2].nx>0.5f)continue;for(uint32_t j=0;j<3;j++){const GrVertex& vertex=source[i+j];vk.rtFramePositions.push_back(vertex.vsx);vk.rtFramePositions.push_back(vertex.vsy);vk.rtFramePositions.push_back(vertex.vsz);}}}uint32_t slot=vk.uniformSlot++%kUniformSlots;vk.uniforms.fogColorStrength[0]=g_PsyX_FogColor[0];vk.uniforms.fogColorStrength[1]=g_PsyX_FogColor[1];vk.uniforms.fogColorStrength[2]=g_PsyX_FogColor[2];vk.uniforms.fogColorStrength[3]=g_PsyX_FogStrength;vk.uniforms.hiresInfo[2]=(g_cfg_psxDither&&!g_PsxDitherSuppressed)?1.f:0;vk.uniforms.hiresInfo[3]=(float)vk.texFormat;vk.uniforms.renderInfo[0]=(float)g_PsxUsePgxp;vk.uniforms.renderInfo[1]=g_PgxpFarWClamp;vk.uniforms.renderInfo[2]=(float)(g_PsxDitherSuppressed?(g_cfg_menuFilter?2:0):(g_cfg_bilinearFiltering?1:0));float size=g_PsyX_FlashlightFpsMode?g_PsyX_FlashlightSizeFps:g_PsyX_FlashlightSize;vk.uniforms.renderInfo[3]=1-size*(1-g_PsyX_FlashlightInnerCos);memcpy(vk.uniforms.lightPosRange,g_PsyX_FlashlightPos,12);vk.uniforms.lightPosRange[3]=g_PsyX_FlashlightRange;memcpy(vk.uniforms.lightDirStyle,g_PsyX_FlashlightDir,12);vk.uniforms.lightDirStyle[3]=0.0f;float intensity=g_PsyX_FlashlightFpsMode?g_PsyX_FlashlightIntensityFps:g_PsyX_FlashlightIntensity;for(int i=0;i<3;i++)vk.uniforms.lightColor[i]=g_PsyX_FlashlightColor[i]*intensity;vk.uniforms.lightColor[3]=1-size*(1-g_PsyX_FlashlightOuterCos);vk.uniforms.effectInfo[0]=(g_PsyX_UsePerPixelFlashlight&&g_PsyX_FlashlightActive)?1.0f:0.0f;vk.uniforms.effectInfo[1]=(float)g_PsyX_FlashlightStyle;vk.uniforms.effectInfo[2]=(float)g_PsxFogToBlack;vk.uniforms.effectInfo[3]=(g_PsyX_UseFlashlightShadows&&g_PsyX_UsePerPixelFlashlight&&g_PsyX_FlashlightActive&&g_PsyX_ShadowsAllowed&&!g_PsxPresentLastFrame&&vk.shadowView)?1.0f:0.0f;memcpy(vk.uniforms.shadowMatrix,vk.shadowLightMatrix,sizeof(vk.shadowLightMatrix));vk.uniforms.shadowParams[0]=vk.uniforms.effectInfo[3];vk.uniforms.shadowParams[1]=g_PsyX_FlashlightShadowBias;vk.uniforms.shadowParams[2]=g_PsyX_FlashlightShadowNormalOffset;vk.uniforms.shadowParams[3]=g_PsyX_FlashlightShadowStrength;vk.uniforms.shadowClip[0]=vk.shadowZNear;vk.uniforms.shadowClip[1]=vk.shadowZFar;vk.uniforms.shadowClip[2]=1.0f/(float)kShadowMapSize;vk.uniforms.shadowClip[3]=g_PsyX_FlashlightShadowFadeDist;memcpy((char*)vk.uniformMap+slot*vk.uniformStride,&vk.uniforms,sizeof(vk.uniforms));
+    if(!vk.recording||!tris)return;if(g_cfg_rtgi&&vk.rayQueryAvailable&&vk.currentVertexSlice&&vk.boundTexture==g_vramTexture&&vk.blend==BM_NONE&&!vk.inOffscreen){const GrVertex* source=(const GrVertex*)vk.currentVertexSlice->mapped;uint32_t first=(uint32_t)std::max(start,0),end=std::min<uint32_t>(first+(uint32_t)tris*3,vk.currentVertexSlice->vertexCount);for(uint32_t i=first;i+2<end;i+=3)CaptureRayTriangle(source+i);}uint32_t slot=vk.uniformSlot++%kUniformSlots;vk.uniforms.fogColorStrength[0]=g_PsyX_FogColor[0];vk.uniforms.fogColorStrength[1]=g_PsyX_FogColor[1];vk.uniforms.fogColorStrength[2]=g_PsyX_FogColor[2];vk.uniforms.fogColorStrength[3]=g_PsyX_FogStrength;vk.uniforms.hiresInfo[2]=(g_cfg_psxDither&&!g_PsxDitherSuppressed)?1.f:0;vk.uniforms.hiresInfo[3]=(float)vk.texFormat;vk.uniforms.renderInfo[0]=(float)g_PsxUsePgxp;vk.uniforms.renderInfo[1]=g_PgxpFarWClamp;vk.uniforms.renderInfo[2]=(float)(g_PsxDitherSuppressed?(g_cfg_menuFilter?2:0):(g_cfg_bilinearFiltering?1:0));float size=g_PsyX_FlashlightFpsMode?g_PsyX_FlashlightSizeFps:g_PsyX_FlashlightSize;vk.uniforms.renderInfo[3]=1-size*(1-g_PsyX_FlashlightInnerCos);memcpy(vk.uniforms.lightPosRange,g_PsyX_FlashlightPos,12);vk.uniforms.lightPosRange[3]=g_PsyX_FlashlightRange;memcpy(vk.uniforms.lightDirStyle,g_PsyX_FlashlightDir,12);vk.uniforms.lightDirStyle[3]=0.0f;float intensity=g_PsyX_FlashlightFpsMode?g_PsyX_FlashlightIntensityFps:g_PsyX_FlashlightIntensity;for(int i=0;i<3;i++)vk.uniforms.lightColor[i]=g_PsyX_FlashlightColor[i]*intensity;vk.uniforms.lightColor[3]=1-size*(1-g_PsyX_FlashlightOuterCos);vk.uniforms.effectInfo[0]=(g_PsyX_UsePerPixelFlashlight&&g_PsyX_FlashlightActive)?1.0f:0.0f;vk.uniforms.effectInfo[1]=(float)g_PsyX_FlashlightStyle;vk.uniforms.effectInfo[2]=(float)g_PsxFogToBlack;vk.uniforms.effectInfo[3]=(g_PsyX_UseFlashlightShadows&&g_PsyX_UsePerPixelFlashlight&&g_PsyX_FlashlightActive&&g_PsyX_ShadowsAllowed&&!g_PsxPresentLastFrame&&vk.shadowView)?1.0f:0.0f;memcpy(vk.uniforms.shadowMatrix,vk.shadowLightMatrix,sizeof(vk.shadowLightMatrix));vk.uniforms.shadowParams[0]=vk.uniforms.effectInfo[3];vk.uniforms.shadowParams[1]=g_PsyX_FlashlightShadowBias;vk.uniforms.shadowParams[2]=g_PsyX_FlashlightShadowNormalOffset;vk.uniforms.shadowParams[3]=g_PsyX_FlashlightShadowStrength;vk.uniforms.shadowClip[0]=vk.shadowZNear;vk.uniforms.shadowClip[1]=vk.shadowZFar;vk.uniforms.shadowClip[2]=1.0f/(float)kShadowMapSize;vk.uniforms.shadowClip[3]=g_PsyX_FlashlightShadowFadeDist;memcpy((char*)vk.uniformMap+slot*vk.uniformStride,&vk.uniforms,sizeof(vk.uniforms));
     VkPipeline p=GetPipeline();vkCmdBindPipeline(vk.command,VK_PIPELINE_BIND_POINT_GRAPHICS,p);vkCmdSetViewport(vk.command,0,1,&vk.viewport);VkExtent2D full=vk.inOffscreen?VkExtent2D{(uint32_t)vk.offscreenRect.w,(uint32_t)vk.offscreenRect.h}:vk.extent;VkRect2D s=vk.scissorEnabled?vk.scissor:VkRect2D{{0,0},full};
     const int maxW=(int)full.width,maxH=(int)full.height;
     const int sx=std::clamp(s.offset.x,0,maxW),sy=std::clamp(s.offset.y,0,maxH);
