@@ -1,4 +1,7 @@
-#version 450
+#version 460
+#ifdef RTGI
+#extension GL_EXT_ray_query : require
+#endif
 
 layout(set=0,binding=0) uniform RendererUniforms {
     mat4 projection;
@@ -19,6 +22,9 @@ layout(set=0,binding=0) uniform RendererUniforms {
 layout(set=0,binding=1) uniform sampler2D sceneTexture;
 layout(set=0,binding=2) uniform sampler2D framebufferTexture;
 layout(set=0,binding=3) uniform sampler2D shadowTexture;
+#ifdef RTGI
+layout(set=1,binding=0) uniform accelerationStructureEXT sceneAccelerationStructure;
+#endif
 
 layout(location=0) in vec4 vTexcoord;
 layout(location=1) in vec4 vColor;
@@ -30,6 +36,40 @@ layout(location=6) in vec4 vShadowViewPos;
 layout(location=0) out vec4 outColor;
 
 const vec2 VRAM_TEXEL = vec2(1.0 / 1024.0, 1.0 / 512.0);
+
+vec3 surfaceNormal(vec3 position) {
+    vec3 faceNormal = cross(dFdx(position), dFdy(position));
+    float normalLength = length(faceNormal);
+    vec3 normal = normalLength > 1e-9 ? faceNormal / normalLength : vec3(0.0, 0.0, -1.0);
+    return dot(normal, position) > 0.0 ? -normal : normal;
+}
+
+#ifdef RTGI
+float rayVisibility(vec3 origin, vec3 direction, float maximumDistance) {
+    if (maximumDistance <= 8.0) return 1.0;
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, sceneAccelerationStructure,
+                          gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+                          0xff, origin, 4.0, direction, maximumDistance);
+    while (rayQueryProceedEXT(query)) {}
+    return rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+}
+
+float screenNoise(vec2 position) {
+    return fract(sin(dot(position, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+vec3 cosineHemisphere(vec3 normal, vec2 seed) {
+    float angle = 6.28318530718 * screenNoise(seed);
+    float radius = sqrt(screenNoise(seed.yx + vec2(31.17, 9.73)));
+    vec3 tangent = normalize(abs(normal.z) < 0.999 ? cross(normal, vec3(0.0, 0.0, 1.0))
+                                                   : cross(normal, vec3(0.0, 1.0, 0.0)));
+    vec3 bitangent = cross(normal, tangent);
+    return normalize(tangent * (cos(angle) * radius) +
+                     bitangent * (sin(angle) * radius) +
+                     normal * sqrt(max(0.0, 1.0 - radius * radius)));
+}
+#endif
 
 vec2 readVRAM(vec2 uv) {
     return floor(texture(sceneTexture, uv).rg * 255.0 + 0.5) / 255.0;
@@ -116,6 +156,19 @@ void main() {
 
     vec3 albedo = color.rgb;
     color *= vColor;
+#ifdef RTGI
+    if (vIs3D > 0.5 && vViewPos.z > 0.0) {
+        vec3 normal = surfaceNormal(vViewPos);
+        vec3 rayOrigin = vViewPos + normal * 6.0;
+        vec3 bounceDirection = cosineHemisphere(normal, gl_FragCoord.xy);
+        float bounceVisibility = rayVisibility(rayOrigin, bounceDirection, 520.0);
+        /* One hardware visibility ray supplies contact AO and an environment
+         * bounce. The deliberately restrained energy preserves the PSX grade. */
+        color.rgb *= mix(0.68, 1.0, bounceVisibility);
+        vec3 ambientBounce = max(ubo.fogColorStrength.rgb, vec3(0.035));
+        color.rgb += albedo * ambientBounce * (0.12 * bounceVisibility);
+    }
+#endif
     if (ubo.effectInfo.x > 0.5 && vViewPos.z > 0.0) {
         vec3 lightDir = normalize(ubo.lightDirStyle.xyz);
         bool classicStyle = ubo.effectInfo.y > 0.5;
@@ -139,10 +192,7 @@ void main() {
                                              ubo.lightPosRange.w,
                                              attenuationDistance);
         } else {
-            vec3 faceNormal = cross(dFdx(vViewPos), dFdy(vViewPos));
-            float normalLength = length(faceNormal);
-            vec3 N = normalLength > 1e-9 ? faceNormal / normalLength : vec3(0.0, 0.0, -1.0);
-            if (dot(N, vViewPos) > 0.0) N = -N;
+            vec3 N = surfaceNormal(vViewPos);
             ndl = 0.15 + 0.85 * max(dot(N, L), 0.0);
             attenuation = clamp(1.0 - distanceToLight / max(ubo.lightPosRange.w, 1.0), 0.0, 1.0);
         }
@@ -187,6 +237,10 @@ void main() {
                 }
             }
         }
+#ifdef RTGI
+        vec3 rtNormal = surfaceNormal(vViewPos);
+        shadow *= rayVisibility(vViewPos + rtNormal * 6.0, L, max(distanceToLight - 10.0, 0.0));
+#endif
         color.rgb += albedo * ubo.lightColor.rgb * cone * attenuation * ndl * shadow;
     }
     float fog = clamp(vFog * ubo.fogColorStrength.a, 0.0, 1.0);

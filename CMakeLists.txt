@@ -46,6 +46,13 @@ if(PSYX_RENDERER_VULKAN)
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/render/vulkan/psx.frag"
         VERBATIM)
     add_custom_command(
+        OUTPUT "${PSYX_VK_GEN}/psx_rt_frag_spv.h"
+        COMMAND "${PSYX_GLSLANG}" -V --target-env vulkan1.2 -DRTGI=1 --vn g_psx_rt_frag_spv
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/render/vulkan/psx.frag"
+                -o "${PSYX_VK_GEN}/psx_rt_frag_spv.h"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/render/vulkan/psx.frag"
+        VERBATIM)
+    add_custom_command(
         OUTPUT "${PSYX_VK_GEN}/post_vert_spv.h"
         COMMAND "${PSYX_GLSLANG}" -V --target-env vulkan1.1 --vn g_post_vert_spv
                 "${CMAKE_CURRENT_SOURCE_DIR}/src/render/vulkan/post.vert"
@@ -79,6 +86,7 @@ if(PSYX_RENDERER_VULKAN)
     target_sources(psycross_static PRIVATE
         "${PSYX_VK_GEN}/psx_vert_spv.h"
         "${PSYX_VK_GEN}/psx_frag_spv.h"
+        "${PSYX_VK_GEN}/psx_rt_frag_spv.h"
         "${PSYX_VK_GEN}/post_vert_spv.h"
         "${PSYX_VK_GEN}/post_frag_spv.h"
         "${PSYX_VK_GEN}/shadow_vert_spv.h"
