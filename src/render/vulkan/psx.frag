@@ -57,7 +57,7 @@ vec3 surfaceNormal(vec3 position) {
 
 #ifdef RTGI
 float rayVisibility(vec3 origin, vec3 direction, float maximumDistance) {
-    if (maximumDistance <= 8.0) return 1.0;
+    if (ubo.lightDirStyle.w < 0.5 || maximumDistance <= 8.0) return 1.0;
     rayQueryEXT query;
     rayQueryInitializeEXT(query, sceneAccelerationStructure,
                           gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
@@ -144,6 +144,7 @@ vec4 sampleNative(vec2 tc, int format) {
 
 #ifdef RTGI
 bool traceReflection(vec3 origin, vec3 direction, float maximumDistance, out vec3 radiance) {
+    if (ubo.lightDirStyle.w < 0.5) return false;
     rayQueryEXT query;
     rayQueryInitializeEXT(query, sceneAccelerationStructure, gl_RayFlagsOpaqueEXT,
                           0xff, origin, 6.0, direction, maximumDistance);
@@ -175,6 +176,23 @@ float inferredMetalness(vec3 albedo) {
      * are the safest proxy for steel; dark cloth and bright plaster stay rough. */
     return (1.0 - smoothstep(0.12, 0.38, saturation)) *
            smoothstep(0.16, 0.42, luminance) * (1.0 - smoothstep(0.82, 0.98, luminance));
+}
+
+float distributionGGX(float nDotH, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float denominator = nDotH * nDotH * (a2 - 1.0) + 1.0;
+    return a2 / max(3.14159265 * denominator * denominator, 1e-5);
+}
+
+float geometrySchlickGGX(float nDotDirection, float roughness) {
+    float r = roughness + 1.0;
+    float k = (r * r) * 0.125;
+    return nDotDirection / max(nDotDirection * (1.0 - k) + k, 1e-5);
+}
+
+vec3 fresnelSchlick(float cosine, vec3 f0) {
+    return f0 + (1.0 - f0) * pow(1.0 - clamp(cosine, 0.0, 1.0), 5.0);
 }
 #endif
 
@@ -236,6 +254,12 @@ void main() {
     if (ubo.effectInfo.x > 0.5 && vViewPos.z > 0.0) {
         vec3 lightDir = normalize(ubo.lightDirStyle.xyz);
         bool classicStyle = ubo.effectInfo.y > 0.5;
+#ifdef RTGI
+        /* RT mode always treats Harry's emitter as a real spotlight located at
+         * the tracked hand/light position; the legacy camera-space offset is
+         * retained only by the classic raster path. */
+        classicStyle = false;
+#endif
         vec3 lightOrigin = classicStyle ? ubo.lightPosRange.xyz - lightDir * 39.0
                                         : ubo.lightPosRange.xyz;
         vec3 toLight = lightOrigin - vViewPos;
@@ -244,7 +268,7 @@ void main() {
         float cone = smoothstep(ubo.lightColor.w, ubo.renderInfo.w, dot(-L, lightDir));
         float ndl = 1.0;
         float attenuation;
-        color.rgb *= classicStyle ? 0.49 : 0.15;
+        color.rgb *= classicStyle ? 0.49 : 0.20;
         if (classicStyle) {
             cone = cone * (2.0 - cone);
             float attenuationDistance = distanceToLight * 2.0;
@@ -302,25 +326,44 @@ void main() {
             }
         }
 #ifdef RTGI
-        vec3 rtNormal = surfaceNormal(vViewPos);
-        shadow *= rayVisibility(vViewPos + rtNormal * 6.0, L, max(distanceToLight - 10.0, 0.0));
-#endif
-        color.rgb += albedo * ubo.lightColor.rgb * cone * attenuation * ndl * shadow;
-#ifdef RTGI
-        /* A visible flashlight response on painted metal. The visibility term
-         * is the same hardware ray used by the diffuse beam, so highlights are
-         * correctly removed when an object blocks the light. */
+        vec3 N = surfaceNormal(vViewPos);
+        vec3 V = normalize(-vViewPos);
+        vec3 H = normalize(L + V);
+        float nDotL = max(dot(N, L), 0.0);
+        float nDotV = max(dot(N, V), 0.001);
+        float nDotH = max(dot(N, H), 0.0);
+        float hDotV = max(dot(H, V), 0.0);
+
+        /* Smooth inverse-square spotlight attenuation in the game's view-space
+         * units. It retains a finite near-field value and reaches exactly zero
+         * at the configured flashlight range. */
+        float range = max(ubo.lightPosRange.w, 1.0);
+        float normalizedDistance = distanceToLight / range;
+        float rangeWindow = clamp(1.0 - normalizedDistance * normalizedDistance, 0.0, 1.0);
+        rangeWindow *= rangeWindow;
+        attenuation = rangeWindow / (1.0 + 10.0 * normalizedDistance * normalizedDistance);
+
+        /* The ray begins on the receiver and terminates just before Harry's
+         * emitter. When temporal geometry is unavailable, the raster shadow
+         * value above is kept for one frame rather than querying stale space. */
+        if (ubo.lightDirStyle.w > 0.5)
+            shadow = rayVisibility(vViewPos + N * 6.0, L, max(distanceToLight - 10.0, 0.0));
+
         float metalness = inferredMetalness(albedo);
-        if (metalness > 0.03) {
-            vec3 N = surfaceNormal(vViewPos);
-            vec3 V = normalize(-vViewPos);
-            vec3 H = normalize(L + V);
-            float specularPower = mix(28.0, 112.0, metalness);
-            float specular = pow(max(dot(N, H), 0.0), specularPower);
-            float fresnel = 0.12 + 0.88 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
-            color.rgb += ubo.lightColor.rgb * cone * attenuation * shadow *
-                         specular * metalness * mix(0.55, 1.5, fresnel);
-        }
+        float roughness = mix(0.72, 0.18, metalness);
+        vec3 f0 = mix(vec3(0.04), albedo, metalness);
+        vec3 fresnel = fresnelSchlick(hDotV, f0);
+        float distribution = distributionGGX(nDotH, roughness);
+        float geometry = geometrySchlickGGX(nDotV, roughness) *
+                         geometrySchlickGGX(nDotL, roughness);
+        vec3 specular = distribution * geometry * fresnel /
+                        max(4.0 * nDotV * max(nDotL, 0.001), 0.001);
+        vec3 diffuse = (vec3(1.0) - fresnel) * (1.0 - metalness) *
+                       albedo * (1.0 / 3.14159265);
+        vec3 emittedRadiance = ubo.lightColor.rgb * cone * attenuation * shadow * 4.2;
+        color.rgb += (diffuse + specular) * emittedRadiance * nDotL;
+#else
+        color.rgb += albedo * ubo.lightColor.rgb * cone * attenuation * ndl * shadow;
 #endif
     }
     float fog = clamp(vFog * ubo.fogColorStrength.a, 0.0, 1.0);
