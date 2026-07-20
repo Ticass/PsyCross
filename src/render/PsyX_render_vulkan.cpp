@@ -224,9 +224,13 @@ struct VulkanState {
     uint32_t vertexSliceIndex = 0;
     VertexSlice* currentVertexSlice = nullptr;
     std::vector<float> rtFramePositions;
+    std::vector<float> rtReferencePositions;
     std::vector<RayMaterial> rtFrameMaterials;
     RayScene rtCurrent{},rtPending{};
     bool rtPromotionPending = false;
+    bool rtTemporalValid = false;
+    uint32_t rtTemporalSamples = 0;
+    double rtTemporalSquaredError = 0.0;
     VkDescriptorSet rtDescriptor = VK_NULL_HANDLE;
     VkBuffer uniformBuffer = VK_NULL_HANDLE;
     VkDeviceMemory uniformMemory = VK_NULL_HANDLE;
@@ -539,8 +543,12 @@ static VkShaderModule Shader(const uint32_t* data, size_t size) {
     VkShaderModule m{}; Check(vkCreateShaderModule(vk.device,&ci,nullptr,&m),"shader module"); return m;
 }
 
+static bool RaySceneUsable() {
+    return GR_RayTracingEnabled()&&vk.rtTemporalValid&&vk.rtCurrent.tlas;
+}
+
 static VkPipeline GetPipeline() {
-    const bool useRayTracing=GR_RayTracingEnabled()&&vk.rtCurrent.tlas&&!vk.inOffscreen&&vk.rtFrag&&vk.rtPipelineLayout;
+    const bool useRayTracing=RaySceneUsable()&&!vk.inOffscreen&&vk.rtFrag&&vk.rtPipelineLayout;
     PipelineKey key{(uint8_t)vk.blend,(uint8_t)vk.depth,(uint8_t)vk.depthAlways,(uint8_t)vk.stencil,(uint8_t)vk.wire,(uint8_t)vk.inOffscreen,(uint8_t)useRayTracing};
     for (auto& p:vk.pipelines) if (p.key==key) return p.pipeline;
     VkPipelineShaderStageCreateInfo stages[2]{};
@@ -850,11 +858,11 @@ void GR_BeginScene(){
     if(vk.recreate){DestroySwapchain();if(!CreateSwapchain())return;vk.recreate=false;}
     if(!vk.swapchain)return;
     EnsureCaptureTexture();if(vk.postSetLayout)EnsurePostTarget();
-    vkWaitForFences(vk.device,1,&vk.fence,VK_TRUE,UINT64_MAX);DestroyRetiredTextures();PromoteRayScene();vk.rtFramePositions.clear();vk.rtFrameMaterials.clear();vk.currentVertexSlice=nullptr;
+    vkWaitForFences(vk.device,1,&vk.fence,VK_TRUE,UINT64_MAX);DestroyRetiredTextures();PromoteRayScene();vk.rtReferencePositions=vk.rtFramePositions;vk.rtFramePositions.clear();vk.rtFrameMaterials.clear();vk.rtTemporalValid=false;vk.rtTemporalSamples=0;vk.rtTemporalSquaredError=0.0;vk.currentVertexSlice=nullptr;
     /* Headless/automated validation hook: seed one harmless view-space triangle
      * so device creation, BLAS/TLAS build, descriptor binding and the RT shader
      * can all be exercised without navigating from the title into gameplay. */
-    static int rtSmoke=-1;if(rtSmoke<0)rtSmoke=getenv("PSYX_RT_SMOKE")?1:0;if(rtSmoke&&g_cfg_rtgi&&vk.rayQueryAvailable){const float triangle[]={-64.0f,-64.0f,512.0f,64.0f,-64.0f,512.0f,0.0f,64.0f,512.0f};vk.rtFramePositions.assign(triangle,triangle+9);RayMaterial material{};material.color0[0]=material.color0[1]=material.color0[2]=material.color0[3]=1.0f;memcpy(material.color1,material.color0,sizeof(material.color0));memcpy(material.color2,material.color0,sizeof(material.color0));vk.rtFrameMaterials.push_back(material);}
+    static int rtSmoke=-1;if(rtSmoke<0)rtSmoke=getenv("PSYX_RT_SMOKE")?1:0;if(rtSmoke&&g_cfg_rtgi&&vk.rayQueryAvailable){const float triangle[]={-64.0f,-64.0f,512.0f,64.0f,-64.0f,512.0f,0.0f,64.0f,512.0f};vk.rtFramePositions.assign(triangle,triangle+9);RayMaterial material{};material.color0[0]=material.color0[1]=material.color0[2]=material.color0[3]=1.0f;memcpy(material.color1,material.color0,sizeof(material.color0));memcpy(material.color2,material.color0,sizeof(material.color0));vk.rtFrameMaterials.push_back(material);vk.rtTemporalValid=vk.rtCurrent.tlas!=VK_NULL_HANDLE;}
     for(uint32_t i=0;i<vk.framebufferReadPendingCount&&vk.framebufferReadReadyCount<kFramebufferRegions;i++)vk.framebufferReadReadyRects[vk.framebufferReadReadyCount++]=vk.framebufferReadPendingRects[i];
     vk.framebufferReadPendingCount=0;vk.overlayUploadCursor=0;vk.overlayPassSuspended=false;vk.vertexSliceIndex=0;
     VkResult ar=vkAcquireNextImageKHR(vk.device,vk.swapchain,UINT64_MAX,vk.acquired,VK_NULL_HANDLE,&vk.imageIndex);
@@ -994,6 +1002,28 @@ static void CaptureRayTriangle(const GrVertex* vertex)
     const float cx=ay*bz-az*by,cy=az*bx-ax*bz,cz=ax*by-ay*bx;
     if(cx*cx+cy*cy+cz*cz<1.0e-6f)return;
 
+    /* The current BLAS was collected one frame ago in camera/view space. Test
+     * the same stable prefix of submitted geometry before allowing any query.
+     * Camera movement changes every view-space vertex; sampling a stale BLAS
+     * produces displaced, recognisable texture fragments on unrelated walls. */
+    const size_t referenceOffset=vk.rtFramePositions.size();
+    if(vk.rtTemporalSamples<192&&referenceOffset+9<=vk.rtReferencePositions.size()){
+        for(int i=0;i<3;i++){
+            const float current[3]={vertex[i].vsx,vertex[i].vsy,vertex[i].vsz};
+            for(int axis=0;axis<3;axis++){
+                const double difference=(double)current[axis]-(double)vk.rtReferencePositions[referenceOffset+i*3+axis];
+                vk.rtTemporalSquaredError+=difference*difference;
+            }
+        }
+        vk.rtTemporalSamples+=3;
+        if(vk.rtTemporalSamples>=24){
+            const double rms=std::sqrt(vk.rtTemporalSquaredError/(double)(vk.rtTemporalSamples*3));
+            vk.rtTemporalValid=rms<=3.0;
+        }
+    }else if(vk.rtTemporalSamples<24){
+        vk.rtTemporalValid=false;
+    }
+
     for(int i=0;i<3;i++){
         vk.rtFramePositions.push_back(vertex[i].vsx);
         vk.rtFramePositions.push_back(vertex[i].vsy);
@@ -1032,7 +1062,7 @@ void GR_DrawTriangles(int start,int tris){
     const uint32_t sw=std::min(s.extent.width,(uint32_t)(maxW-sx)),sh=std::min(s.extent.height,(uint32_t)(maxH-sy));
     s.offset={sx,sy};s.extent={sw,sh};
     if(sw==0||sh==0)return;
-    vkCmdSetScissor(vk.command,0,1,&s);float blend[4]={.25f,.25f,.25f,.25f};vkCmdSetBlendConstants(vk.command,blend);vkCmdSetDepthBias(vk.command,vk.polygonOffset,0.0f,0.0f);uint32_t offset=(uint32_t)(slot*vk.uniformStride);VkDescriptorSet set=vk.textures[vk.boundTexture].descriptor;const bool rtActive=GR_RayTracingEnabled()&&vk.rtCurrent.tlas&&!vk.inOffscreen&&vk.rtPipelineLayout;VkPipelineLayout layout=rtActive?vk.rtPipelineLayout:vk.pipelineLayout;vkCmdBindDescriptorSets(vk.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout,0,1,&set,1,&offset);if(rtActive)vkCmdBindDescriptorSets(vk.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout,1,1,&vk.rtDescriptor,0,nullptr);vkCmdDraw(vk.command,tris*3,1,start,0);
+    vkCmdSetScissor(vk.command,0,1,&s);float blend[4]={.25f,.25f,.25f,.25f};vkCmdSetBlendConstants(vk.command,blend);vkCmdSetDepthBias(vk.command,vk.polygonOffset,0.0f,0.0f);uint32_t offset=(uint32_t)(slot*vk.uniformStride);VkDescriptorSet set=vk.textures[vk.boundTexture].descriptor;const bool rtActive=RaySceneUsable()&&!vk.inOffscreen&&vk.rtPipelineLayout;VkPipelineLayout layout=rtActive?vk.rtPipelineLayout:vk.pipelineLayout;vkCmdBindDescriptorSets(vk.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout,0,1,&set,1,&offset);if(rtActive)vkCmdBindDescriptorSets(vk.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout,1,1,&vk.rtDescriptor,0,nullptr);vkCmdDraw(vk.command,tris*3,1,start,0);
 }
 
 void GR_EnableDepth(int e){vk.depth=((e&&g_cfg_pgxpZBuffer)||g_PsyX_ForceItemDepth);}
